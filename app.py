@@ -1,6 +1,11 @@
 # =====================================================
-# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + Cox验证 (Streamlit)
+# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + Cox验证 (Streamlit) —— 已修好版
+# 关键修复：
+# 1) download_button 触发 rerun 后结果不消失：全部结果缓存到 st.session_state
+# 2) SHAP 返回形状兼容处理：避免 summary_plot 形状断言报错
+# 3) lifelines 不存在时：自动跳过 Cox，不中断主流程
 # =====================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -36,6 +41,41 @@ def set_seed(seed: int):
 @st.cache_data(show_spinner=False)
 def read_csv_cached(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
+
+
+def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
+    """
+    兼容 shap 的多种返回格式，最终保证输出 (n_samples, n_features)
+    """
+    # shap_values 可能是 list 或 ndarray
+    if isinstance(shap_values, list):
+        shap_z = shap_values[0]
+    else:
+        shap_z = shap_values
+
+    shap_z = np.array(shap_z)
+
+    # 可能是 (n, d, 1)
+    if shap_z.ndim == 3 and shap_z.shape[-1] == 1:
+        shap_z = shap_z[:, :, 0]
+
+    # 有些版本可能 (1, n, d) 或其它奇怪形状，做兜底
+    if shap_z.ndim == 3 and shap_z.shape[0] == 1:
+        shap_z = shap_z[0]
+
+    if shap_z.ndim != 2:
+        raise ValueError(f"Unexpected SHAP shape: {shap_z.shape}")
+
+    if shap_z.shape[0] != features_2d.shape[0] or shap_z.shape[1] != features_2d.shape[1]:
+        raise ValueError(
+            f"Shape mismatch: shap={shap_z.shape}, features={features_2d.shape}. "
+            "Please check mlp_predict output shape and SHAP processing."
+        )
+    return shap_z
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
 
 # =====================================================
@@ -83,7 +123,15 @@ class MLP(nn.Module):
 # Streamlit 页面
 # =====================================================
 st.set_page_config(page_title="VAEjMLP latent-SHAP", layout="wide")
-st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析（完整整合版）")
+st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析（完整整合版｜已修好）")
+
+# ===== 顶部工具按钮：清空缓存 =====
+with st.expander("🧰 工具", expanded=False):
+    if st.button("🧹 清空缓存结果（不会清空上传文件）"):
+        for k in list(st.session_state.keys()):
+            if k.startswith("cache_"):
+                st.session_state.pop(k, None)
+        st.rerun()
 
 with st.sidebar:
     st.header("参数设置")
@@ -92,7 +140,13 @@ with st.sidebar:
     n_epochs = st.number_input("训练轮数 epochs", min_value=10, max_value=2000, value=100, step=10)
     lr = st.number_input("学习率 lr", min_value=1e-5, max_value=1e-1, value=1e-3, step=1e-4, format="%.5f")
 
-    ce_weight = st.number_input("CE 权重（loss = KL + ce_weight*CE）", min_value=0.0, max_value=10.0, value=0.001, step=0.001)
+    ce_weight = st.number_input(
+        "CE 权重（loss = KL + ce_weight*CE）",
+        min_value=0.0,
+        max_value=10.0,
+        value=0.001,
+        step=0.001,
+    )
 
     test_size = st.slider("test_size", 0.05, 0.5, 0.2, 0.05)
 
@@ -108,7 +162,6 @@ with st.sidebar:
 
     background_n = st.slider("background 样本数", 10, 200, 50)
     shap_nsamples = st.slider("KernelExplainer nsamples", 50, 500, 100, 50)
-
     st.caption("提示：KernelExplainer 可能较慢；n_runs 大时建议降低 nsamples 或 background。")
 
     st.divider()
@@ -128,8 +181,9 @@ surv_file = st.file_uploader("（可选）上传 生存数据（Sample, Time, Ev
 
 run_button = st.button("🚀 运行模型")
 
+
 # =====================================================
-# 主流程
+# 运行主流程
 # =====================================================
 if run_button:
     if (rna_file is None) or (label_file is None):
@@ -154,14 +208,13 @@ if run_button:
         rna = rna.rename(columns={"Unnamed: 0": "Gene"}).set_index("Gene")
 
     # 对齐样本
-    samples_rna = list(rna.columns)
-    samples_lab = labels["Sample"].astype(str).tolist()
+    samples_rna = list(map(str, rna.columns.tolist()))
     rna.columns = rna.columns.astype(str)
     labels["Sample"] = labels["Sample"].astype(str)
 
-    if set(samples_rna) != set(samples_lab):
+    if set(samples_rna) != set(labels["Sample"].tolist()):
         st.warning("RNA 样本与 Label 样本集合不完全一致，将取交集对齐。")
-        common = sorted(list(set(samples_rna).intersection(set(samples_lab))))
+        common = sorted(list(set(samples_rna).intersection(set(labels["Sample"].tolist()))))
         if len(common) < 4:
             st.error("对齐后共同样本数太少（<4），无法训练。")
             st.stop()
@@ -180,13 +233,13 @@ if run_button:
     # =====================================================
     # 多次运行：收集 metrics / gene_importance / shap_z（仅最后一次用于画图）
     # =====================================================
-    all_importances = []     # list[pd.Series] index=genes
-    topk_lists = []          # list[list[str]]
-    metrics_runs = []        # list[dict]
+    all_importances = []  # list[pd.Series] index=genes
+    topk_lists = []       # list[list[str]]
+    metrics_runs = []     # list[dict]
     last_shap_z = None
     last_z_test = None
+    last_latent_df = None
 
-    # 如果用户跑很多次：给个进度条
     prog = st.progress(0)
     status = st.empty()
 
@@ -198,7 +251,11 @@ if run_button:
 
         # ---- split ----
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=float(test_size), random_state=seed, stratify=y if len(np.unique(y)) == 2 else None
+            X,
+            y,
+            test_size=float(test_size),
+            random_state=seed,
+            stratify=y if len(np.unique(y)) == 2 else None,
         )
 
         X_train_t = torch.tensor(X_train, dtype=torch.float32)
@@ -231,7 +288,6 @@ if run_button:
             z_test, _, _ = vae(X_test_t)
             y_pred_test = mlp(z_test).cpu().numpy().flatten()
 
-        # 一些数据集可能导致 AUC 报错（测试集中只有一个类）
         try:
             auc = roc_auc_score(y_test, y_pred_test)
         except Exception:
@@ -239,67 +295,46 @@ if run_button:
 
         y_hat = (y_pred_test > 0.5).astype(int)
 
-        metrics_runs.append({
-            "run": run_i,
-            "seed": seed,
-            "AUC": auc,
-            "Accuracy": accuracy_score(y_test, y_hat),
-            "Precision": precision_score(y_test, y_hat, zero_division=0),
-            "Recall": recall_score(y_test, y_hat, zero_division=0),
-        })
+        metrics_runs.append(
+            {
+                "run": run_i,
+                "seed": seed,
+                "AUC": auc,
+                "Accuracy": accuracy_score(y_test, y_hat),
+                "Precision": precision_score(y_test, y_hat, zero_division=0),
+                "Recall": recall_score(y_test, y_hat, zero_division=0),
+            }
+        )
 
         # =====================================================
         # latent SHAP（KernelExplainer）
         # =====================================================
         with torch.no_grad():
             z_train, _, _ = vae(X_train_t)
+
         z_train_np = z_train.cpu().numpy()
         z_test_np = z_test.cpu().numpy()
 
-
+        # ★ 建议返回 1D，减少 shap 输出歧义
         def mlp_predict(z_numpy):
             z_t = torch.tensor(z_numpy, dtype=torch.float32)
             with torch.no_grad():
                 out = mlp(z_t).cpu().numpy()
-            return out.reshape(-1)  # <-- 关键：返回 1D
+            return out.reshape(-1)  # (n,)
 
         bg_n = int(min(background_n, z_train_np.shape[0]))
         background_z = shap.sample(z_train_np, bg_n)
 
         explainer = shap.KernelExplainer(mlp_predict, background_z)
-
         shap_values = explainer.shap_values(z_test_np, nsamples=int(shap_nsamples))
-
-        # --- 兼容不同 shap 版本的返回类型/形状 ---
-        if isinstance(shap_values, list):
-            shap_z = shap_values[0]
-        else:
-            shap_z = shap_values
-
-        # 如果是 (n, d, 1) → squeeze 成 (n, d)
-        shap_z = np.array(shap_z)
-        if shap_z.ndim == 3 and shap_z.shape[-1] == 1:
-            shap_z = shap_z[:, :, 0]
-
-        # 最终保证是二维 (n_samples, n_features)
-        if shap_z.ndim != 2:
-            raise ValueError(f"Unexpected shap_z shape: {shap_z.shape}")
-
-        # 保险校验，便于你定位
-        if shap_z.shape[0] != z_test_np.shape[0] or shap_z.shape[1] != z_test_np.shape[1]:
-            raise ValueError(
-                f"Shape mismatch: shap_z={shap_z.shape}, z_test={z_test_np.shape}. "
-                "Check mlp_predict output shape and shap_values processing."
-            )
+        shap_z = ensure_2d_shap(shap_values, z_test_np)  # (n_test, latent_dim)
 
         # =====================================================
         # latent → gene 映射（保持与你原逻辑一致）
         # =====================================================
         W_gene_hidden = vae.fc1.weight.detach().cpu().numpy()  # (1024, n_genes)
-        abs_shap_z = np.mean(np.abs(shap_z), axis=0)           # (latent_dim,)
+        abs_shap_z = np.mean(np.abs(shap_z), axis=0)          # (latent_dim,)
 
-        # 这里你的原式：只差在 W_fc1 的列强弱，latent shap 只是全局缩放
-        # 先保持一致，保证复现；后续你需要更论文级映射我可以再升级
         gene_importance = {}
         scale = float(np.sum(abs_shap_z))
         for i, gene in enumerate(genes):
@@ -307,7 +342,6 @@ if run_button:
 
         imp_s = pd.Series(gene_importance).reindex(genes)
         all_importances.append(imp_s)
-
         topk_lists.append(imp_s.sort_values(ascending=False).head(int(top_k)).index.tolist())
 
         # 保存最后一次 run 的 shap 用于画图
@@ -315,30 +349,24 @@ if run_button:
             last_shap_z = shap_z
             last_z_test = z_test_np
 
+            abs_latent = np.mean(np.abs(shap_z), axis=0)
+            last_latent_df = (
+                pd.DataFrame({"LatentDim": np.arange(len(abs_latent)), "MeanAbsSHAP": abs_latent})
+                .sort_values("MeanAbsSHAP", ascending=False)
+                .reset_index(drop=True)
+            )
+
         prog.progress((run_i + 1) / int(n_runs))
 
     status.empty()
     prog.empty()
 
     # =====================================================
-    # 汇总输出：模型性能（多次run）
+    # 汇总输出：模型性能（多次 run）
     # =====================================================
     metrics_df = pd.DataFrame(metrics_runs)
-    st.success("运行完成！")
-
-    st.subheader("📊 模型性能（每次 run）")
-    st.dataframe(metrics_df)
-
-    st.subheader("📊 模型性能汇总（均值±标准差）")
-    summary = metrics_df[["AUC", "Accuracy", "Precision", "Recall"]].agg(["mean", "std"]).T.reset_index()
-    summary.columns = ["Metric", "Mean", "Std"]
-    st.dataframe(summary)
-
-    st.download_button(
-        "⬇ 下载所有 run 的模型指标",
-        metrics_df.to_csv(index=False),
-        "model_metrics_all_runs.csv",
-    )
+    summary_df = metrics_df[["AUC", "Accuracy", "Precision", "Recall"]].agg(["mean", "std"]).T.reset_index()
+    summary_df.columns = ["Metric", "Mean", "Std"]
 
     # =====================================================
     # 汇总输出：基因重要性稳定性（Mean / CV / Frequency）
@@ -351,61 +379,124 @@ if run_button:
     cv_imp = std_imp / (mean_imp.abs() + 1e-12)
 
     from collections import Counter
+
     freq_counter = Counter([g for lst in topk_lists for g in lst])
     freq = pd.Series({g: freq_counter.get(g, 0) / float(n_runs) for g in genes})
 
-    stability_df = pd.DataFrame({
-        "Gene": genes,
-        "MeanImportance": mean_imp.values,
-        "StdImportance": std_imp.values,
-        "CV": cv_imp.values,
-        f"Top{int(top_k)}_Freq": freq.values,
-    }).sort_values([f"Top{int(top_k)}_Freq", "MeanImportance"], ascending=[False, False])
-
-    st.subheader("📌 生物标志物稳定性（Frequency / CV）")
-    st.dataframe(stability_df.head(50))
-
-    st.download_button(
-        "⬇ 下载稳定性统计表",
-        stability_df.to_csv(index=False),
-        "biomarker_stability.csv",
+    freq_col = f"Top{int(top_k)}_Freq"
+    stability_df = (
+        pd.DataFrame(
+            {
+                "Gene": genes,
+                "MeanImportance": mean_imp.values,
+                "StdImportance": std_imp.values,
+                "CV": cv_imp.values,
+                freq_col: freq.values,
+            }
+        )
+        .sort_values([freq_col, "MeanImportance"], ascending=[False, False])
+        .reset_index(drop=True)
     )
 
-    # 兼容你原来的“Top 20 biomarkers”输出：用稳定性均值排名
-    st.subheader("🧬 Top 20 潜在生物标志物（MeanImportance 排名）")
-    st.dataframe(stability_df.sort_values("MeanImportance", ascending=False).head(20))
+    # =====================================================
+    # 把结果缓存到 session_state（download 触发 rerun 也不丢）
+    # =====================================================
+    st.session_state["cache_metrics_df"] = metrics_df
+    st.session_state["cache_summary_df"] = summary_df
+    st.session_state["cache_stability_df"] = stability_df
+    st.session_state["cache_latent_df"] = last_latent_df
 
+    st.session_state["cache_csv_metrics_all"] = to_csv_bytes(metrics_df)
+    st.session_state["cache_csv_summary"] = to_csv_bytes(summary_df)
+    st.session_state["cache_csv_stability"] = to_csv_bytes(stability_df)
+    st.session_state["cache_csv_latent"] = to_csv_bytes(last_latent_df) if last_latent_df is not None else None
+
+    # 也把图需要的数组存起来（如果你不想存太大数据，可删除这两行）
+    st.session_state["cache_last_shap_z"] = last_shap_z
+    st.session_state["cache_last_z_test"] = last_z_test
+
+    st.success("运行完成！已缓存结果，点击任意下载不会清空。")
+
+
+# =====================================================
+# 结果展示区：优先展示缓存结果（即使 download 触发 rerun 也能继续显示/下载）
+# =====================================================
+st.divider()
+st.subheader("📦 当前缓存结果")
+
+if "cache_stability_df" not in st.session_state:
+    st.write("暂无缓存结果。请上传数据并点击「🚀 运行模型」。")
+    st.stop()
+
+metrics_df = st.session_state["cache_metrics_df"]
+summary_df = st.session_state["cache_summary_df"]
+stability_df = st.session_state["cache_stability_df"]
+latent_df = st.session_state.get("cache_latent_df", None)
+
+st.subheader("📊 模型性能（每次 run）")
+st.dataframe(metrics_df, use_container_width=True)
+
+st.subheader("📊 模型性能汇总（均值±标准差）")
+st.dataframe(summary_df, use_container_width=True)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.download_button(
+        "⬇ 下载所有 run 的模型指标",
+        st.session_state.get("cache_csv_metrics_all", b""),
+        "model_metrics_all_runs.csv",
+        mime="text/csv",
+    )
+with c2:
+    st.download_button(
+        "⬇ 下载指标汇总（均值±标准差）",
+        st.session_state.get("cache_csv_summary", b""),
+        "model_metrics_summary.csv",
+        mime="text/csv",
+    )
+with c3:
+    # 兼容你原来文件名
     st.download_button(
         "⬇ 下载全部基因重要性（Mean/CV/Freq）",
-        stability_df.to_csv(index=False),
+        st.session_state.get("cache_csv_stability", b""),
         "latent_shap_gene_importance_stability.csv",
+        mime="text/csv",
     )
 
-    # =====================================================
-    # SHAP 可视化（使用最后一次 run 的 shap_z）
-    # =====================================================
-    if last_shap_z is not None and last_z_test is not None:
-        st.subheader("🔍 Latent SHAP Summary（dot）")
+st.subheader("📌 生物标志物稳定性（Frequency / CV）")
+st.dataframe(stability_df.head(50), use_container_width=True)
 
-        last_shap_z = np.array(last_shap_z)
-        if last_shap_z.ndim == 3 and last_shap_z.shape[-1] == 1:
-            last_shap_z = last_shap_z[:, :, 0]
+st.download_button(
+    "⬇ 下载稳定性统计表",
+    st.session_state.get("cache_csv_stability", b""),
+    "biomarker_stability.csv",
+    mime="text/csv",
+)
 
-        fig1 = plt.figure()
-        shap.summary_plot(last_shap_z, features=last_z_test, show=False)
-        st.pyplot(fig1)
+st.subheader("🧬 Top 20 潜在生物标志物（MeanImportance 排名）")
+st.dataframe(stability_df.sort_values("MeanImportance", ascending=False).head(20), use_container_width=True)
 
-        st.subheader("📊 Latent SHAP Summary（bar）")
-        fig2 = plt.figure()
-        shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
-        st.pyplot(fig2)
+# =====================================================
+# SHAP 可视化（用缓存的最后一次 run）
+# =====================================================
+last_shap_z = st.session_state.get("cache_last_shap_z", None)
+last_z_test = st.session_state.get("cache_last_z_test", None)
 
-        abs_latent = np.mean(np.abs(last_shap_z), axis=0)
-        latent_df = pd.DataFrame({"LatentDim": np.arange(len(abs_latent)), "MeanAbsSHAP": abs_latent})
-        latent_df = latent_df.sort_values("MeanAbsSHAP", ascending=False)
+if (last_shap_z is not None) and (last_z_test is not None):
+    st.divider()
+    st.subheader("🔍 Latent SHAP Summary（dot）")
+    fig1 = plt.figure()
+    shap.summary_plot(last_shap_z, features=last_z_test, show=False)
+    st.pyplot(fig1)
 
+    st.subheader("📊 Latent SHAP Summary（bar）")
+    fig2 = plt.figure()
+    shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
+    st.pyplot(fig2)
+
+    if latent_df is not None:
         st.subheader("📈 Top 20 Latent 维度重要性（MeanAbsSHAP）")
-        st.dataframe(latent_df.head(20))
+        st.dataframe(latent_df.head(20), use_container_width=True)
 
         fig3 = plt.figure()
         plt.bar(latent_df.head(20)["LatentDim"].astype(str), latent_df.head(20)["MeanAbsSHAP"])
@@ -413,98 +504,125 @@ if run_button:
         plt.tight_layout()
         st.pyplot(fig3)
 
-        st.download_button(
-            "⬇ 下载 latent 维度 MeanAbsSHAP",
-            latent_df.to_csv(index=False),
-            "latent_mean_abs_shap.csv",
-        )
+        csv_latent = st.session_state.get("cache_csv_latent", None)
+        if csv_latent is not None:
+            st.download_button(
+                "⬇ 下载 latent 维度 MeanAbsSHAP",
+                csv_latent,
+                "latent_mean_abs_shap.csv",
+                mime="text/csv",
+            )
 
-    # =====================================================
-    # Cox 生存验证（可选）
-    # =====================================================
-    if use_survival:
-        if surv_file is None:
-            st.warning("你开启了 Cox 验证，但没有上传生存数据文件。")
+# =====================================================
+# Cox 生存验证（可选）：lifelines 缺失则跳过，不中断
+# =====================================================
+if use_survival:
+    st.divider()
+    st.subheader("⏱ Cox 生存验证（可选）")
+
+    if surv_file is None:
+        st.warning("你开启了 Cox 验证，但没有上传生存数据文件。")
+    else:
+        try:
+            from lifelines import CoxPHFitter
+            from lifelines.utils import concordance_index
+
+            lifelines_ok = True
+        except Exception:
+            lifelines_ok = False
+
+        if not lifelines_ok:
+            st.warning("未检测到 lifelines，已自动跳过 Cox 验证（可用 pip install lifelines 启用）。")
         else:
-            try:
-                from lifelines import CoxPHFitter
-                from lifelines.utils import concordance_index
-            except Exception:
-                st.error("未检测到 lifelines。请先安装：pip install lifelines")
-                st.stop()
-
+            # 重新读取文件（download 触发 rerun 时，surv_file 仍可能存在）
             surv = read_csv_cached(surv_file)
 
             needed = {"Sample", "Time", "Event"}
             if not needed.issubset(set(surv.columns)):
                 st.error("生存数据必须包含列：Sample, Time, Event")
-                st.stop()
-
-            surv["Sample"] = surv["Sample"].astype(str)
-            surv = surv.set_index("Sample")
-
-            # 对齐到 RNA 样本
-            common = list(set(rna.columns.astype(str)).intersection(set(surv.index.astype(str))))
-            if len(common) < 10:
-                st.error("生存数据与 RNA 的共同样本太少（<10），无法做 Cox 验证。")
-                st.stop()
-
-            common = [s for s in rna.columns.astype(str) if s in common]  # 保持 RNA 顺序
-            surv_aligned = surv.loc[common]
-            rna_aligned = rna[common]
-
-            # 选稳定基因
-            freq_col = f"Top{int(top_k)}_Freq"
-            selected = stability_df[
-                (stability_df[freq_col] >= float(freq_thr)) & (stability_df["CV"] <= float(cv_thr))
-            ].sort_values(["MeanImportance"], ascending=False)["Gene"].head(int(max_surv_genes)).tolist()
-
-            st.subheader("⏱ Cox 生存验证")
-            st.write({
-                "共同样本数": int(len(common)),
-                "筛选阈值": f"{freq_col}≥{freq_thr}, CV≤{cv_thr}",
-                "进入 Cox 的基因数": int(len(selected)),
-            })
-
-            if len(selected) < 2:
-                st.warning("筛选后基因太少（<2）。请放宽阈值或增大 top_k / n_runs。")
             else:
-                X_surv = rna_aligned.loc[selected].T  # samples x genes
+                surv["Sample"] = surv["Sample"].astype(str)
+                surv = surv.set_index("Sample")
 
-                df_cox = pd.concat([surv_aligned[["Time", "Event"]], X_surv], axis=1).dropna()
-                if df_cox.shape[0] < 10:
-                    st.warning("去除缺失值后样本太少，无法稳定拟合。")
+                # 注意：rna 只在 run_button 时存在；这里从上传文件重新读一遍以保证独立
+                if (rna_file is None):
+                    st.warning("当前会话未检测到 RNA 文件上传（或已刷新）。请重新上传 RNA 文件以进行 Cox 验证。")
                 else:
-                    df_train, df_test = train_test_split(df_cox, test_size=float(test_size), random_state=int(seed_base))
+                    rna_tmp = read_csv_cached(rna_file)
+                    if "Unnamed: 0" in rna_tmp.columns:
+                        rna_tmp = rna_tmp.rename(columns={"Unnamed: 0": "Gene"}).set_index("Gene")
+                    rna_tmp.columns = rna_tmp.columns.astype(str)
 
-                    cph = CoxPHFitter(penalizer=float(cox_penalizer))
-                    cph.fit(df_train, duration_col="Time", event_col="Event")
+                    common = list(set(rna_tmp.columns).intersection(set(surv.index)))
+                    if len(common) < 10:
+                        st.error("生存数据与 RNA 的共同样本太少（<10），无法做 Cox 验证。")
+                    else:
+                        # 保持 RNA 顺序
+                        common = [s for s in rna_tmp.columns if s in common]
+                        surv_aligned = surv.loc[common]
+                        rna_aligned = rna_tmp[common]
 
-                    risk = cph.predict_partial_hazard(df_test)
-                    c_index = concordance_index(df_test["Time"], -risk.values, df_test["Event"])
+                        freq_col = f"Top{int(top_k)}_Freq"
+                        selected = (
+                            stability_df[
+                                (stability_df[freq_col] >= float(freq_thr)) & (stability_df["CV"] <= float(cv_thr))
+                            ]
+                            .sort_values("MeanImportance", ascending=False)["Gene"]
+                            .head(int(max_surv_genes))
+                            .tolist()
+                        )
 
-                    st.write({"C-index": float(c_index)})
+                        st.write(
+                            {
+                                "共同样本数": int(len(common)),
+                                "筛选阈值": f"{freq_col}≥{freq_thr}, CV≤{cv_thr}",
+                                "进入 Cox 的基因数": int(len(selected)),
+                            }
+                        )
 
-                    st.subheader("📌 Cox 回归系数 Top 20")
-                    coef_df = cph.summary.reset_index().rename(columns={"index": "Feature"})
-                    coef_df = coef_df.sort_values("coef", ascending=False)
-                    st.dataframe(coef_df.head(20))
+                        if len(selected) < 2:
+                            st.warning("筛选后基因太少（<2）。请放宽阈值或增大 top_k / n_runs。")
+                        else:
+                            X_surv = rna_aligned.loc[selected].T  # samples x genes
+                            df_cox = pd.concat([surv_aligned[["Time", "Event"]], X_surv], axis=1).dropna()
 
-                    st.download_button(
-                        "⬇ 下载 Cox summary",
-                        cph.summary.to_csv(),
-                        "cox_summary.csv",
-                    )
+                            if df_cox.shape[0] < 10:
+                                st.warning("去除缺失值后样本太少，无法稳定拟合。")
+                            else:
+                                df_train, df_test = train_test_split(
+                                    df_cox, test_size=float(test_size), random_state=int(seed_base)
+                                )
 
-                    # 风险分数导出
-                    out_risk = pd.DataFrame({
-                        "Sample": df_test.index.astype(str),
-                        "Time": df_test["Time"].values,
-                        "Event": df_test["Event"].values,
-                        "RiskScore": risk.values.flatten()
-                    })
-                    st.download_button(
-                        "⬇ 下载测试集风险分数（RiskScore）",
-                        out_risk.to_csv(index=False),
-                        "cox_test_risk_scores.csv",
-                    )
+                                cph = CoxPHFitter(penalizer=float(cox_penalizer))
+                                cph.fit(df_train, duration_col="Time", event_col="Event")
+
+                                risk = cph.predict_partial_hazard(df_test)
+                                c_index = concordance_index(df_test["Time"], -risk.values, df_test["Event"])
+                                st.write({"C-index": float(c_index)})
+
+                                st.subheader("📌 Cox 回归系数 Top 20")
+                                coef_df = cph.summary.reset_index().rename(columns={"index": "Feature"})
+                                coef_df = coef_df.sort_values("coef", ascending=False)
+                                st.dataframe(coef_df.head(20), use_container_width=True)
+
+                                st.download_button(
+                                    "⬇ 下载 Cox summary",
+                                    cph.summary.to_csv().encode("utf-8"),
+                                    "cox_summary.csv",
+                                    mime="text/csv",
+                                )
+
+                                out_risk = pd.DataFrame(
+                                    {
+                                        "Sample": df_test.index.astype(str),
+                                        "Time": df_test["Time"].values,
+                                        "Event": df_test["Event"].values,
+                                        "RiskScore": risk.values.flatten(),
+                                    }
+                                )
+                                st.download_button(
+                                    "⬇ 下载测试集风险分数（RiskScore）",
+                                    out_risk.to_csv(index=False).encode("utf-8"),
+                                    "cox_test_risk_scores.csv",
+                                    mime="text/csv",
+                                )
