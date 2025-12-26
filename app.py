@@ -123,7 +123,7 @@ class MLP(nn.Module):
 # Streamlit 页面
 # =====================================================
 st.set_page_config(page_title="VAEjMLP latent-SHAP", layout="wide")
-st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析（完整整合版｜已修好）")
+st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析")
 
 # ===== 顶部工具按钮：清空缓存 =====
 with st.expander("🧰 工具", expanded=False):
@@ -626,3 +626,4 @@ if use_survival:
                                     "cox_test_risk_scores.csv",
                                     mime="text/csv",
                                 )
+
