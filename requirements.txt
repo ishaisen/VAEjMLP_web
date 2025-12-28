@@ -8,3 +8,4 @@ shap
 lifelines
 gseapy
 scipy
+statsmodels
