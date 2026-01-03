@@ -3,22 +3,25 @@
 # VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + Cox验证 + Top20:
 #   ① 主流程：VAE+MLP、多次 run 稳定性（Freq/CV）、Top20、latent SHAP
 #   ② 下载区：所有结果持久化（download 不清空）
-#   ③ GO/KEGG 富集（gseapy.enrichr, 需联网）
-#   ④ 差异分析（labels 两组，Welch t-test + FDR + 火山图 + 箱线图）
-#   ⑤ 聚类（Top20 表达）+ 聚类分组生存（KM/logrank/Cox）
+#   ③ GO/KEGG 富集分析（Top20，gseapy/enrichr，需要外网）
+#   ④ 差异分析（labels 两组，t-test+FDR + volcano + boxplot）
+#   ⑤ 聚类（Top20）+ 热图 + 聚类结果生存分析（KM/logrank/Cox）
 #
-# ✅ 已修复：差异分析报错 KeyError 'Sample'
-#   - clean_columns() 去 BOM/空白
-#   - normalize_labels_df() 强制输出 Sample/Label 并清洗列名
-#   - compute_de_top_genes() 使用 reindex 对齐，避免 loc KeyError
+# ✅ 修复：
+# - 差异分析 KeyError 'Sample'（BOM/不可见字符）：clean_columns + normalize_labels_df + reindex 对齐
+# - SHAP shape 兼容：ensure_2d_shap
+# - download 后结果不消失：全部写入 st.session_state
 #
-# 依赖：
-#   基础：streamlit pandas numpy torch scikit-learn shap matplotlib
-#   差异：scipy statsmodels
-#   富集：gseapy（需要外网访问 Enrichr）
-#   生存：lifelines
+# ✅ UI 修改（你要求的）：
+# - 隐藏「示例数据目录 / RNA文件名 / labels文件名 / survival文件名」
+# - 侧边栏默认只显示一个「使用示例数据（Demo）」开关
+# - 打开后才显示导航/参数/上传器/运行按钮/所有模块
+#
+# ✅ Demo 文件固定读取 app.py 同目录：
+#   TCGA_GTEX_tmp.csv / labels.csv / sur.csv
 # =====================================================
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -34,6 +37,7 @@ from sklearn.cluster import KMeans
 
 import shap
 import matplotlib.pyplot as plt
+
 
 # ----------------- Optional deps -----------------
 try:
@@ -64,11 +68,19 @@ except Exception:
 
 
 # =====================================================
+# Demo files (HIDDEN)
+# =====================================================
+DEMO_DIR = "."
+DEMO_RNA = "TCGA_GTEX_tmp.csv"
+DEMO_LAB = "labels.csv"
+DEMO_SUR = "sur.csv"
+
+
+# =====================================================
 # Utils
 # =====================================================
 def set_seed(seed: int):
     import random
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -82,12 +94,16 @@ def read_csv_cached(uploaded_file) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
 
 
+@st.cache_data(show_spinner=False)
+def read_csv_path_cached(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
 def safe_rename_index_col(df: pd.DataFrame) -> pd.DataFrame:
-    # 兼容：用户没设置 index_col 导致出现 Unnamed: 0
     if "Unnamed: 0" in df.columns:
         df = df.rename(columns={"Unnamed: 0": "Gene"}).set_index("Gene")
     return df
@@ -98,43 +114,29 @@ def _norm(s: str) -> str:
 
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ 去 BOM/空白，避免出现肉眼看是 Sample 实际是 \ufeffSample 的 KeyError
-    """
     df = df.copy()
     df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     return df
 
 
 def normalize_labels_df(labels_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    ✅ 强制输出两列：Sample, Label
-    - 自动识别列名
-    - 去 BOM/空白
-    """
-    labels = clean_columns(labels_raw)
-
+    labels = clean_columns(labels_raw.copy())
     if labels.shape[1] < 2:
         raise ValueError("Label 文件至少需要两列（样本列 + 标签列）。")
 
-    col_norm_map = {_norm(c): c for c in labels.columns}
-
+    col_map = {_norm(c): c for c in labels.columns}
     sample_alias = ["sample", "sampleid", "sample_id", "id", "patient", "patientid", "subject", "subjectid"]
     label_alias = ["label", "group", "class", "y", "target", "phenotype", "status", "casecontrol", "case_control"]
 
     sample_col = None
     label_col = None
-
     for a in sample_alias:
-        key = _norm(a)
-        if key in col_norm_map:
-            sample_col = col_norm_map[key]
+        if _norm(a) in col_map:
+            sample_col = col_map[_norm(a)]
             break
-
     for a in label_alias:
-        key = _norm(a)
-        if key in col_norm_map:
-            label_col = col_norm_map[key]
+        if _norm(a) in col_map:
+            label_col = col_map[_norm(a)]
             break
 
     if sample_col is None:
@@ -144,17 +146,10 @@ def normalize_labels_df(labels_raw: pd.DataFrame) -> pd.DataFrame:
 
     labels = labels.rename(columns={sample_col: "Sample", label_col: "Label"})
     labels["Sample"] = labels["Sample"].astype(str).str.strip()
-    labels["Label"] = labels["Label"]
-
     return labels[["Sample", "Label"]]
 
 
 def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
-    """
-    rna: genes x samples
-    labels: Sample, Label
-    返回：对齐后的 rna, labels（顺序严格与 rna.columns 一致）
-    """
     rna = safe_rename_index_col(rna_raw.copy())
     rna = clean_columns(rna)
     rna.columns = rna.columns.astype(str)
@@ -164,6 +159,7 @@ def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
     samples_rna = set(rna.columns.tolist())
     samples_lab = set(labels["Sample"].tolist())
     common = sorted(list(samples_rna.intersection(samples_lab)))
+
     if len(common) < 4:
         raise ValueError(f"RNA 与 Label 交集样本数太少（{len(common)}），无法训练。")
 
@@ -172,34 +168,22 @@ def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
         rna = rna[common]
         labels = labels.set_index("Sample").loc[common].reset_index()
 
-    # 保证顺序一致
     labels = labels.set_index("Sample").loc[rna.columns].reset_index()
-
-    # 保险：列名必须存在
     labels = clean_columns(labels)
-    if "Sample" not in labels.columns:
-        labels = labels.rename(columns={labels.columns[0]: "Sample"})
-    if "Label" not in labels.columns:
-        raise ValueError("labels 中未找到 Label 列，请检查上传文件。")
+
+    if "Sample" not in labels.columns or "Label" not in labels.columns:
+        labels = normalize_labels_df(labels)
 
     return rna, labels
 
 
 def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
-    """
-    兼容 shap 多版本返回值：
-    - list([array])
-    - array
-    - (n,d,1) / (1,n,d) 等
-    最终输出 (n,d)
-    """
     if isinstance(shap_values, list):
         shap_z = shap_values[0]
     else:
         shap_z = shap_values
 
     shap_z = np.array(shap_z)
-
     if shap_z.ndim == 3 and shap_z.shape[-1] == 1:
         shap_z = shap_z[:, :, 0]
     if shap_z.ndim == 3 and shap_z.shape[0] == 1:
@@ -215,10 +199,6 @@ def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
 
 
 def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: list):
-    """
-    ✅ 两组差异：Welch t-test + log2FC + BH-FDR
-    ✅ 不再用 loc[rna.columns] 直接索引（容易 KeyError），改用 reindex
-    """
     if not SCIPY_OK:
         raise RuntimeError("缺少 scipy，无法做 t-test。请安装：pip install scipy")
     if not STATSMODELS_OK:
@@ -233,7 +213,6 @@ def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: lis
     else:
         lab["Sample"] = lab["Sample"].astype(str).str.strip()
 
-    # ✅ 用 reindex 对齐，避免 KeyError
     lab2 = lab.set_index("Sample").reindex(rna.columns)
 
     missing = lab2.index[lab2["Label"].isna()].tolist()
@@ -256,8 +235,10 @@ def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: lis
     for gene in top_genes:
         if gene not in rna.index:
             continue
+
         x0 = rna.loc[gene].reindex(s0).astype(float).values
         x1 = rna.loc[gene].reindex(s1).astype(float).values
+
         stat, p = ttest_ind(x1, x0, equal_var=False, nan_policy="omit")
         m0 = np.nanmean(x0)
         m1 = np.nanmean(x1)
@@ -274,9 +255,6 @@ def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: lis
 
 
 def run_enrichr(top_genes: list, organism: str = "Human"):
-    """
-    GO/KEGG via Enrichr (gseapy.enrichr) —— 需要联网
-    """
     if not GSEAPY_OK:
         raise RuntimeError("缺少 gseapy，无法做 GO/KEGG。请安装：pip install gseapy")
 
@@ -303,9 +281,6 @@ def run_enrichr(top_genes: list, organism: str = "Human"):
 
 
 def cluster_samples_by_top_genes(rna: pd.DataFrame, top_genes: list, n_clusters: int = 2, seed: int = 42):
-    """
-    基于 Top genes 表达做 KMeans 聚类
-    """
     rna = clean_columns(rna.copy())
     rna.columns = rna.columns.astype(str)
 
@@ -399,19 +374,36 @@ class MLP(nn.Module):
 
 
 # =====================================================
-# Page + Navigation
+# Streamlit Page + Gate
 # =====================================================
 st.set_page_config(page_title="VAEjMLP latent-SHAP BioApp", layout="wide")
-st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析")
+st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析（完整整合版）")
 
 with st.expander("🧰 工具", expanded=False):
     if st.button("🧹 清空缓存结果（不会清空上传文件）"):
         for k in list(st.session_state.keys()):
-            if k.startswith("cache_"):
+            if k.startswith("cache_") or k == "cache_demo_surv_raw":
                 st.session_state.pop(k, None)
         st.rerun()
 
+# --- Sidebar: only show the switch until enabled ---
 with st.sidebar:
+    st.header("示例数据")
+    use_demo_gate = st.checkbox("使用示例数据（Demo）", value=False)
+    if not use_demo_gate:
+        st.info("当前仅显示此开关。打开后才显示完整功能与参数。")
+
+if not use_demo_gate:
+    st.markdown("### 🔒 当前仅展示示例数据开关")
+    st.write("打开左侧「使用示例数据（Demo）」后，页面会显示完整模块、参数、上传器与运行按钮。")
+    st.stop()
+
+
+# =====================================================
+# Full sidebar (shown only after demo gate enabled)
+# =====================================================
+with st.sidebar:
+    st.divider()
     st.header("导航")
     module = st.radio(
         "选择模块",
@@ -449,31 +441,62 @@ with st.sidebar:
 
 
 # =====================================================
-# Upload area (global)
+# Uploaders + Run button
 # =====================================================
 st.divider()
+st.info("已打开 Demo 开关：你可以直接使用示例数据运行；也可以上传自己的数据（非 Demo）。")
+
 u1, u2, u3 = st.columns([1, 1, 1])
 with u1:
-    rna_file = st.file_uploader("上传 RNA-seq（genes×samples）CSV", type="csv", key="rna_uploader")
+    rna_file = st.file_uploader("上传 RNA-seq（genes×samples）CSV（可选）", type="csv", key="rna_uploader")
 with u2:
-    label_file = st.file_uploader("上传 Label CSV（列名可不同，会自动识别 Sample/Label）", type="csv", key="label_uploader")
+    label_file = st.file_uploader("上传 Label CSV（Sample/Label，可选）", type="csv", key="label_uploader")
 with u3:
-    surv_file = st.file_uploader("上传 生存 CSV（Sample, Time, Event，可选）", type="csv", key="surv_uploader")
+    surv_file = st.file_uploader("上传 生存 CSV（Sample,Time,Event，可选）", type="csv", key="surv_uploader")
 
-run_button = st.button("🚀 运行主流程（训练 + SHAP + 稳定性）", type="primary")
+use_demo_data = st.checkbox("本次运行使用示例数据（忽略上传）", value=True)
+run_button = st.button("🚀 运行主流程", type="primary")
 
 
 # =====================================================
-# Main pipeline
+# Main pipeline: train + shap + stability
 # =====================================================
 if run_button:
-    if rna_file is None or label_file is None:
-        st.error("请先上传 RNA 表达矩阵和 Label 文件。")
-        st.stop()
+    # ---------- choose demo or upload ----------
+    if use_demo_data:
+        rna_path = os.path.join(DEMO_DIR, DEMO_RNA)
+        lab_path = os.path.join(DEMO_DIR, DEMO_LAB)
+        sur_path = os.path.join(DEMO_DIR, DEMO_SUR)
 
-    with st.spinner("读取并对齐数据..."):
-        rna_raw = read_csv_cached(rna_file)
-        labels_raw = read_csv_cached(label_file)
+        if (not os.path.exists(rna_path)) or (not os.path.exists(lab_path)):
+            st.error(
+                "示例数据文件不存在。请把示例文件放在 app.py 同目录：\n"
+                f"- {rna_path}\n- {lab_path}\n- {sur_path}（可选）"
+            )
+            st.stop()
+
+        with st.spinner("读取示例数据中..."):
+            rna_raw = read_csv_path_cached(rna_path)
+            labels_raw = read_csv_path_cached(lab_path)
+
+        if os.path.exists(sur_path):
+            st.session_state["cache_demo_surv_raw"] = read_csv_path_cached(sur_path)
+        else:
+            st.session_state["cache_demo_surv_raw"] = None
+
+        st.success("示例数据已加载。")
+
+    else:
+        st.session_state["cache_demo_surv_raw"] = None
+        if rna_file is None or label_file is None:
+            st.error("未选择示例数据时，必须上传 RNA 与 Label。")
+            st.stop()
+        with st.spinner("读取上传数据中..."):
+            rna_raw = read_csv_cached(rna_file)
+            labels_raw = read_csv_cached(label_file)
+
+    # ---------- align ----------
+    with st.spinner("对齐样本中..."):
         try:
             rna, labels = align_rna_labels(rna_raw, labels_raw)
         except Exception as e:
@@ -486,9 +509,9 @@ if run_button:
 
     genes = rna.index.astype(str).tolist()
     y = labels["Label"].values
-
     X = MinMaxScaler().fit_transform(rna.T.values)
 
+    # multi-run containers
     all_importances = []
     topk_lists = []
     metrics_runs = []
@@ -505,11 +528,8 @@ if run_button:
         status.write(f"Run {run_i+1}/{n_runs} | seed={seed}")
 
         X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=float(test_size),
-            random_state=seed,
-            stratify=y if len(pd.Series(y).unique()) == 2 else None,
+            X, y, test_size=float(test_size), random_state=seed,
+            stratify=y if len(pd.Series(y).unique()) == 2 else None
         )
 
         X_train_t = torch.tensor(X_train, dtype=torch.float32)
@@ -520,6 +540,7 @@ if run_button:
         mlp = MLP(int(latent_dim))
         optimizer = optim.Adam(list(vae.parameters()) + list(mlp.parameters()), lr=float(lr))
 
+        # train
         vae.train()
         mlp.train()
         for _ in range(int(n_epochs)):
@@ -535,6 +556,7 @@ if run_button:
         vae.eval()
         mlp.eval()
 
+        # predict
         with torch.no_grad():
             z_test, _, _ = vae(X_test_t)
             y_pred_test = mlp(z_test).cpu().numpy().flatten()
@@ -545,18 +567,16 @@ if run_button:
             auc = np.nan
 
         y_hat = (y_pred_test > 0.5).astype(int)
+        metrics_runs.append({
+            "run": run_i,
+            "seed": seed,
+            "AUC": auc,
+            "Accuracy": accuracy_score(y_test, y_hat),
+            "Precision": precision_score(y_test, y_hat, zero_division=0),
+            "Recall": recall_score(y_test, y_hat, zero_division=0),
+        })
 
-        metrics_runs.append(
-            {
-                "run": run_i,
-                "seed": seed,
-                "AUC": auc,
-                "Accuracy": accuracy_score(y_test, y_hat),
-                "Precision": precision_score(y_test, y_hat, zero_division=0),
-                "Recall": recall_score(y_test, y_hat, zero_division=0),
-            }
-        )
-
+        # SHAP on latent
         with torch.no_grad():
             z_train, _, _ = vae(X_train_t)
 
@@ -571,11 +591,12 @@ if run_button:
 
         bg_n = int(min(background_n, z_train_np.shape[0]))
         background_z = shap.sample(z_train_np, bg_n)
-
         explainer = shap.KernelExplainer(mlp_predict, background_z)
-        shap_values = explainer.shap_values(z_test_np, nsamples=int(shap_nsamples))
-        shap_z = ensure_2d_shap(shap_values, z_test_np)
 
+        shap_values = explainer.shap_values(z_test_np, nsamples=int(shap_nsamples))
+        shap_z = ensure_2d_shap(shap_values, z_test_np)  # (n_test, latent_dim)
+
+        # latent -> gene importance (保持原逻辑)
         W_gene_hidden = vae.fc1.weight.detach().cpu().numpy()
         abs_shap_z = np.mean(np.abs(shap_z), axis=0)
         scale = float(np.sum(abs_shap_z))
@@ -603,10 +624,12 @@ if run_button:
     status.empty()
     prog.empty()
 
+    # aggregate metrics
     metrics_df = pd.DataFrame(metrics_runs)
     summary_df = metrics_df[["AUC", "Accuracy", "Precision", "Recall"]].agg(["mean", "std"]).T.reset_index()
     summary_df.columns = ["Metric", "Mean", "Std"]
 
+    # stability
     imp_mat = pd.concat(all_importances, axis=1)
     imp_mat.columns = [f"run_{i}" for i in range(int(n_runs))]
 
@@ -619,22 +642,17 @@ if run_button:
     freq = pd.Series({g: freq_counter.get(g, 0) / float(n_runs) for g in genes})
     freq_col = f"Top{int(top_k)}_Freq"
 
-    stability_df = (
-        pd.DataFrame(
-            {
-                "Gene": genes,
-                "MeanImportance": mean_imp.values,
-                "StdImportance": std_imp.values,
-                "CV": cv_imp.values,
-                freq_col: freq.values,
-            }
-        )
-        .sort_values([freq_col, "MeanImportance"], ascending=[False, False])
-        .reset_index(drop=True)
-    )
+    stability_df = pd.DataFrame({
+        "Gene": genes,
+        "MeanImportance": mean_imp.values,
+        "StdImportance": std_imp.values,
+        "CV": cv_imp.values,
+        freq_col: freq.values,
+    }).sort_values([freq_col, "MeanImportance"], ascending=[False, False]).reset_index(drop=True)
 
     top20_genes = stability_df.sort_values("MeanImportance", ascending=False)["Gene"].head(20).tolist()
 
+    # cache to session_state (download won't clear)
     st.session_state["cache_rna"] = rna
     st.session_state["cache_labels"] = labels
     st.session_state["cache_top20_genes"] = top20_genes
@@ -652,6 +670,7 @@ if run_button:
     st.session_state["cache_csv_stability"] = to_csv_bytes(stability_df)
     st.session_state["cache_csv_latent"] = to_csv_bytes(last_latent_df) if last_latent_df is not None else None
 
+    # clear downstream cached results to avoid mixing old results
     for k in [
         "cache_enrich_go_kegg",
         "cache_de_df",
@@ -667,13 +686,13 @@ if run_button:
 
 
 # =====================================================
-# Module ①
+# Module ①: main display
 # =====================================================
 if module.startswith("①"):
     st.subheader("① 训练 / SHAP / 稳定性（主流程回显）")
 
     if "cache_stability_df" not in st.session_state:
-        st.info("请先上传数据并点击「🚀 运行主流程」。")
+        st.info("请先运行主流程。")
     else:
         metrics_df = st.session_state["cache_metrics_df"]
         summary_df = st.session_state["cache_summary_df"]
@@ -719,7 +738,7 @@ if module.startswith("①"):
 
 
 # =====================================================
-# Module ②
+# Module ②: downloads (all persistent)
 # =====================================================
 if module.startswith("②"):
     st.subheader("② 结果下载与回显（download 不会清空）")
@@ -764,7 +783,7 @@ if module.startswith("②"):
 
 
 # =====================================================
-# Module ③
+# Module ③: GO/KEGG enrichment
 # =====================================================
 if module.startswith("③"):
     st.subheader("③ GO / KEGG 富集分析（Top20）")
@@ -802,12 +821,11 @@ if module.startswith("③"):
                         f"enrichr_{lib}.csv",
                         mime="text/csv",
                     )
-
                 st.caption("提示：如果部署环境无法访问外网，Enrichr 会失败。")
 
 
 # =====================================================
-# Module ④
+# Module ④: Differential analysis (labels groups)
 # =====================================================
 if module.startswith("④"):
     st.subheader("④ 差异分析（labels 分组，Top20）")
@@ -819,8 +837,8 @@ if module.startswith("④"):
         labels = st.session_state["cache_labels"]
         top_genes = st.session_state["cache_top20_genes"]
 
-        with st.expander("🔎 调试信息（labels 真实列名 repr）", expanded=False):
-            st.write([repr(c) for c in labels.columns])
+        with st.expander("🔎 调试信息（labels 预览）", expanded=False):
+            st.write("labels.columns =", [repr(c) for c in labels.columns])
             st.dataframe(labels.head(10), use_container_width=True)
 
         if not SCIPY_OK:
@@ -869,15 +887,14 @@ if module.startswith("④"):
             st.markdown("### 箱线图（选择一个基因）")
             gene_pick = st.selectbox("选择基因", de_df["Gene"].tolist(), index=0)
 
-            # group labels（用 normalize 确保 Sample/Label 正确）
             lab = labels.copy()
-            if "Sample" not in clean_columns(lab).columns or "Label" not in clean_columns(lab).columns:
+            if "Sample" not in lab.columns or "Label" not in lab.columns:
                 lab = normalize_labels_df(lab)
             else:
                 lab = clean_columns(lab)
                 lab["Sample"] = lab["Sample"].astype(str).str.strip()
-            lab2 = lab.set_index("Sample").reindex(rna.columns)
 
+            lab2 = lab.set_index("Sample").reindex(rna.columns)
             groups_u = pd.Series(lab2["Label"].values).unique().tolist()
             s0 = lab2[lab2["Label"] == groups_u[0]].index.tolist()
             s1 = lab2[lab2["Label"] == groups_u[1]].index.tolist()
@@ -894,7 +911,7 @@ if module.startswith("④"):
 
 
 # =====================================================
-# Module ⑤
+# Module ⑤: Clustering + Survival (KM/Cox)
 # =====================================================
 if module.startswith("⑤"):
     st.subheader("⑤ 聚类（Top20） + 生存分析（KM / Cox）")
@@ -937,6 +954,7 @@ if module.startswith("⑤"):
                 mime="text/csv",
             )
 
+            # Heatmap
             if X_scaled_df is not None:
                 st.markdown("### 热图（z-score，样本按 Cluster 排序）")
                 df_plot = X_scaled_df.copy()
@@ -948,21 +966,36 @@ if module.startswith("⑤"):
                 plt.imshow(mat, aspect="auto")
                 plt.colorbar(label="z-score")
                 plt.yticks([])
-                plt.xticks(range(df_plot.shape[1] - 1), df_plot.drop(columns=["Cluster"]).columns, rotation=90, fontsize=7)
+                plt.xticks(
+                    range(df_plot.shape[1] - 1),
+                    df_plot.drop(columns=["Cluster"]).columns,
+                    rotation=90,
+                    fontsize=7,
+                )
                 plt.title("Top20 genes (z-score) sorted by Cluster")
                 plt.tight_layout()
                 st.pyplot(fig_h)
 
+            # Survival analysis
             st.markdown("## 生存分析（用 Cluster 分组）")
-            if surv_file is None:
-                st.info("未上传生存数据（Sample, Time, Event），仅展示聚类结果。")
+
+            # 生存数据：上传优先，否则用 demo 缓存
+            surv_df_source = None
+            if surv_file is not None:
+                surv_df_source = read_csv_cached(surv_file)
+            else:
+                surv_df_source = st.session_state.get("cache_demo_surv_raw", None)
+
+            if surv_df_source is None:
+                st.info("未提供生存数据（上传或示例 sur.csv），跳过 KM/Cox。")
             else:
                 if not LIFELINES_OK:
-                    st.warning("未安装 lifelines：pip install lifelines")
+                    st.warning("未安装 lifelines，无法做 KM/Cox：pip install lifelines")
                 else:
-                    surv = clean_columns(read_csv_cached(surv_file))
+                    surv = clean_columns(surv_df_source.copy())
+
+                    # auto detect sample col if needed
                     if "Sample" not in surv.columns:
-                        # 尝试自动识别 Sample
                         surv_cols = {_norm(c): c for c in surv.columns}
                         for a in ["sample", "sampleid", "id", "subject", "patient"]:
                             if _norm(a) in surv_cols:
@@ -990,20 +1023,26 @@ if module.startswith("⑤"):
                             surv_aligned["Event"] = pd.to_numeric(surv_aligned["Event"], errors="coerce")
                             surv_aligned = surv_aligned.dropna(subset=["Time", "Event", "Cluster"])
 
+                            st.session_state["cache_surv_aligned"] = surv_aligned.reset_index()
+
                             st.markdown("### 对齐后的生存数据（含 Cluster）")
                             st.dataframe(surv_aligned.reset_index().head(50), use_container_width=True)
 
+                            # KM + logrank
                             fig_km, p_lr = km_plot_by_group(surv_aligned, group_col="Cluster")
                             st.pyplot(fig_km)
                             if p_lr is not None:
                                 st.write({"Log-rank p-value (2 groups)": p_lr})
 
+                            # Cox with cluster dummies
                             st.markdown("### Cox（Cluster 作为协变量）")
                             df_cox = surv_aligned[["Time", "Event", "Cluster"]].copy()
                             df_cox = df_cox.reset_index(drop=True)
                             df_cox = pd.get_dummies(df_cox, columns=["Cluster"], drop_first=True)
 
-                            df_train, df_test = train_test_split(df_cox, test_size=float(test_size), random_state=int(seed_base))
+                            df_train, df_test = train_test_split(
+                                df_cox, test_size=float(test_size), random_state=int(seed_base)
+                            )
 
                             cph = CoxPHFitter(penalizer=float(cox_penalizer))
                             cph.fit(df_train, duration_col="Time", event_col="Event")
@@ -1013,6 +1052,7 @@ if module.startswith("⑤"):
                             st.write({"C-index": float(c_index)})
 
                             cox_sum = cph.summary.reset_index()
+                            st.session_state["cache_cox_cluster_summary"] = cox_sum
                             st.dataframe(cox_sum, use_container_width=True)
 
                             st.download_button(
@@ -1022,13 +1062,11 @@ if module.startswith("⑤"):
                                 mime="text/csv",
                             )
 
-                            out_risk = pd.DataFrame(
-                                {
-                                    "Time": df_test["Time"].values,
-                                    "Event": df_test["Event"].values,
-                                    "RiskScore": risk.values.flatten(),
-                                }
-                            )
+                            out_risk = pd.DataFrame({
+                                "Time": df_test["Time"].values,
+                                "Event": df_test["Event"].values,
+                                "RiskScore": risk.values.flatten(),
+                            })
                             st.download_button(
                                 "⬇ 下载 Cox 测试集风险分数",
                                 out_risk.to_csv(index=False).encode("utf-8"),
@@ -1036,10 +1074,15 @@ if module.startswith("⑤"):
                                 mime="text/csv",
                             )
 
+                            if "cache_surv_aligned" in st.session_state:
+                                st.download_button(
+                                    "⬇ 下载 对齐后的生存数据（含 Cluster）",
+                                    st.session_state["cache_surv_aligned"].to_csv(index=False).encode("utf-8"),
+                                    "survival_with_cluster.csv",
+                                    mime="text/csv",
+                                )
 
-# =====================================================
-# Footer
-# =====================================================
+
 st.divider()
 st.caption(
     "依赖提示：基础功能需 streamlit/pandas/numpy/torch/scikit-learn/shap/matplotlib；"
