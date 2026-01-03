@@ -1,11 +1,11 @@
 streamlit
-numpy
 pandas
+numpy
 scikit-learn
 torch
 matplotlib
 shap
-lifelines
-gseapy
 scipy
 statsmodels
+lifelines
+gseapy
