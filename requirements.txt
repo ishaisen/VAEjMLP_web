@@ -9,3 +9,4 @@ scipy
 statsmodels
 lifelines
 gseapy
+tabulate
