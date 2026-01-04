@@ -1,13 +1,11 @@
 # =====================================================
-# app.py (PURE TABS + UI/UX POLISH 1~6 + Sticky Toolbar v2)
-# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + GO/KEGG + DE + 聚类 + 生存
+# app.py (FULL REPLACEABLE VERSION)
+# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + GO/KEGG + DE(含箱线图) + 聚类 + 生存
 #
 # UI:
 #   - Demo gate（未开启时仅显示开关）
-#   - Hero 三区卡片（Input/Workflow/Output）
-#   - 统一 card 布局 + KPI
-#   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md
-#   - 数据输入友好：列识别提示、对齐提示、预览与格式说明
+#   - Hero 卡片 + 统一 card / KPI
+#   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md（不依赖 tabulate）
 #   - Sticky Toolbar（固定顶部 + 锚点跳转 + Tab 高亮 + 回到顶部）
 # =====================================================
 
@@ -207,6 +205,9 @@ def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
 
 
 def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
+    """
+    兼容 shap 返回 list / ndarray / (n, d, 1) 等情况，最终保证 (n, d)
+    """
     if isinstance(shap_values, list):
         shap_z = shap_values[0]
     else:
@@ -225,6 +226,18 @@ def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
         raise ValueError(f"Shape mismatch: shap={shap_z.shape}, features={features_2d.shape}")
 
     return shap_z
+
+
+def df_to_markdown_fallback(df: pd.DataFrame) -> str:
+    """不依赖 tabulate 的 DataFrame -> Markdown 表格"""
+    df2 = df.copy().fillna("")
+    cols = [str(c) for c in df2.columns.tolist()]
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+    rows = []
+    for _, r in df2.iterrows():
+        rows.append("| " + " | ".join([str(x) for x in r.tolist()]) + " |")
+    return "\n".join([header, sep] + rows)
 
 
 def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: list):
@@ -282,6 +295,61 @@ def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: lis
     return de, (g0, g1)
 
 
+def plot_gene_boxplots(rna: pd.DataFrame, labels: pd.DataFrame, genes: list, group_order=None):
+    """
+    rna: genes x samples
+    labels: 必须含 Sample/Label
+    genes: 要画的基因列表
+    """
+    rna = clean_columns(rna.copy())
+    rna.columns = rna.columns.astype(str)
+
+    lab = clean_columns(labels.copy())
+    if ("Sample" not in lab.columns) or ("Label" not in lab.columns):
+        lab, _ = normalize_labels_df(lab)
+    else:
+        lab["Sample"] = lab["Sample"].astype(str).str.strip()
+
+    lab2 = lab.set_index("Sample").reindex(rna.columns)
+    if lab2["Label"].isna().any():
+        missing = lab2.index[lab2["Label"].isna()].tolist()
+        raise ValueError(f"labels 缺少 {len(missing)} 个样本的 Label（示例前5）：{missing[:5]}")
+
+    groups = pd.Series(lab2["Label"].values).unique().tolist()
+    if group_order is not None:
+        groups = [g for g in group_order if g in groups]
+    else:
+        groups = sorted(groups, key=lambda x: str(x))
+
+    genes_exist = [g for g in genes if g in rna.index]
+    if len(genes_exist) == 0:
+        raise ValueError("选择的基因在 RNA 里都找不到。")
+
+    n = len(genes_exist)
+    height = max(4.5, min(1.0 * n + 2.0, 18.0))
+    fig = plt.figure(figsize=(9.5, height))
+
+    for i, gene in enumerate(genes_exist, start=1):
+        ax = plt.subplot(n, 1, i)
+        data = []
+        for g in groups:
+            sids = lab2.index[lab2["Label"] == g].tolist()
+            vals = rna.loc[gene].reindex(sids).astype(float).values
+            data.append(vals)
+
+        ax.boxplot(data, labels=[str(g) for g in groups], showfliers=False)
+        ax.set_title(gene, fontsize=10, loc="left")
+        ax.set_ylabel("Expr")
+        ax.grid(True, axis="y", alpha=0.2)
+        if i != n:
+            ax.set_xlabel("")
+        else:
+            ax.set_xlabel("Label group")
+
+    plt.tight_layout()
+    return fig
+
+
 def run_enrichr(top_genes: list, organism: str = "Human"):
     if not GSEAPY_OK:
         raise RuntimeError("缺少 gseapy，无法做 GO/KEGG。请安装：pip install gseapy")
@@ -316,7 +384,7 @@ def cluster_samples_by_top_genes(rna: pd.DataFrame, top_genes: list, n_clusters:
     if len(genes_exist) < 2:
         raise ValueError("Top genes 在 RNA 中匹配到的基因太少（<2），无法聚类。")
 
-    X = rna.loc[genes_exist].T.astype(float)
+    X = rna.loc[genes_exist].T.astype(float)  # samples x genes
     X_scaled = StandardScaler().fit_transform(X.values)
 
     km = KMeans(n_clusters=int(n_clusters), random_state=int(seed), n_init="auto")
@@ -393,7 +461,7 @@ def build_report_md() -> str:
     summary_df = st.session_state.get("cache_summary_df", None)
 
     md = []
-    md.append("# VAEjMLP latent-SHAP Results Report\n")
+    md.append("# VAEjMLP latent-SHAP Results Report\n\n")
     md.append(f"- Generated at: **{datetime.now().isoformat(timespec='seconds')}**\n")
     md.append(f"- Cached at: **{at}**\n")
     md.append(f"- Data source: **{src}**\n\n")
@@ -408,7 +476,7 @@ def build_report_md() -> str:
 
     md.append("## Metrics Summary (mean ± std)\n")
     if isinstance(summary_df, pd.DataFrame):
-        md.append(summary_df.to_markdown(index=False))
+        md.append(df_to_markdown_fallback(summary_df))
         md.append("\n\n")
     else:
         md.append("- (no summary)\n\n")
@@ -435,9 +503,7 @@ def build_results_zip(ts: str) -> bytes:
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, meta in st.session_state["cache_artifacts"].items():
             zf.writestr(name, meta["bytes"])
-
         zf.writestr("REPORT.md", build_report_md().encode("utf-8"))
-
         meta = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "data_source": st.session_state.get("cache_data_source", "unknown"),
@@ -504,7 +570,7 @@ class MLP(nn.Module):
 
 
 # =====================================================
-# Sticky Toolbar (v2: Active highlight + Back to top)
+# Sticky Toolbar (Active highlight + Back to top)
 # =====================================================
 def render_sticky_toolbar():
     run_ok = "cache_stability_df" in st.session_state
@@ -731,20 +797,7 @@ st.markdown(
       .kpi .value { font-size: 1.3rem; font-weight: 800; margin-top: 2px; }
       .kpi .hint  { font-size: 0.8rem; opacity: 0.55; margin-top: 6px; }
 
-      .badge {
-        display: inline-block;
-        padding: 6px 10px;
-        border-radius: 999px;
-        border: 1px solid rgba(49,51,63,0.15);
-        background: rgba(255,255,255,0.65);
-        font-size: 12px;
-        margin-left: 6px;
-      }
-      .badge.good { border-color: rgba(0, 128, 0, 0.25); }
-      .badge.warn { border-color: rgba(255, 165, 0, 0.35); }
-
       .smallMuted { opacity: 0.70; font-size: 0.90rem; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 
       .stDataFrame { border-radius: 12px; overflow: hidden; }
     </style>
@@ -753,7 +806,7 @@ st.markdown(
 )
 
 st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析平台")
-st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集 → 差异分析 → 聚类与生存验证")
+st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集 → 差异分析（含箱线图）→ 聚类与生存验证")
 
 artifacts_init()
 
@@ -774,7 +827,7 @@ if not use_demo_gate:
           <div class="smallMuted">
             本工具面向 RNA-seq 表达矩阵（genes×samples）与二分类标签，训练 <b>VAE + MLP</b> 学习 latent 表征；
             使用 <b>latent SHAP</b> 解释模型决策并映射回基因层形成候选 biomarkers；
-            支持多次运行做稳定性评估（频率/CV）；并对 Top20 做富集、差异、聚类及生存验证。
+            支持多次运行做稳定性评估（频率/CV）；并对 Top20 做富集、差异（含箱线图）、聚类及生存验证。
           </div>
           <ul class="smallMuted" style="margin-top:10px;">
             <li><b>输入</b>：RNA、labels（Sample/Label）、（可选）survival（Sample/Time/Event）</li>
@@ -788,7 +841,7 @@ if not use_demo_gate:
     st.stop()
 
 # =====================================================
-# Sidebar: parameters only
+# Sidebar: parameters
 # =====================================================
 with st.sidebar:
     st.divider()
@@ -813,33 +866,6 @@ with st.sidebar:
     st.header("聚类/生存参数")
     cluster_k = st.slider("聚类簇数 K", 2, 6, 2)
     cox_penalizer = st.number_input("Cox L2 penalizer", min_value=0.0, max_value=10.0, value=0.1, step=0.1)
-
-# =====================================================
-# Param help popover/expander
-# =====================================================
-def render_param_help():
-    rows = [
-        ["latent_dim", "VAE latent 空间维度", "更大→表达更强但更慢/更易过拟合；常用 32/64/128"],
-        ["epochs", "训练轮数", "越大越充分；过大可能过拟合、耗时增加"],
-        ["lr", "学习率", "太大不收敛，太小收敛慢；常用 1e-3~1e-4"],
-        ["ce_weight", "分类损失权重", "loss = KL + ce_weight * CE；越大越强调分类"],
-        ["test_size", "测试集比例", "0.2 常用；样本少时别太大"],
-        ["n_runs", "重复运行次数", "用于稳定性评估；越大越稳但更慢"],
-        ["top_k", "TopK 频率统计", "每次 run 取前 K 个基因，统计出现频率"],
-        ["seed_base", "随机种子基数", "Run i 的 seed = seed_base + i"],
-        ["background_n", "SHAP 背景样本数", "越大越准但越慢"],
-        ["shap_nsamples", "SHAP 采样数", "越大越准但越慢"],
-        ["cluster_k", "聚类簇数", "Top20 表达做 KMeans 的 K"],
-        ["cox_penalizer", "Cox 正则强度", "越大→更强 L2 正则，减少不稳定"],
-    ]
-    st.dataframe(pd.DataFrame(rows, columns=["参数", "含义", "建议/影响"]), use_container_width=True)
-
-try:
-    with st.popover("📘 参数说明"):
-        render_param_help()
-except Exception:
-    with st.expander("📘 参数说明", expanded=False):
-        render_param_help()
 
 # =====================================================
 # Hero cards
@@ -874,7 +900,7 @@ with hc2:
             VAE 压缩 → MLP 分类 → latent SHAP → 映射回基因 → 多次运行稳定性
           </div>
           <div class="smallMuted" style="margin-top:10px;">
-            下游：GO/KEGG、差异分析、Top20 聚类、生存验证
+            下游：GO/KEGG、差异（含箱线图）、Top20 聚类、生存验证
           </div>
         </div>
         """,
@@ -901,34 +927,13 @@ with hc3:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =====================================================
-# Tools
-# =====================================================
-tools_left, tools_right = st.columns([1, 2])
-with tools_left:
-    if st.button("🧹 清空缓存结果（不清空上传）"):
-        for k in list(st.session_state.keys()):
-            if k.startswith("cache_") or k == "cache_demo_surv_raw":
-                st.session_state.pop(k, None)
-        artifacts_init()
-        st.success("已清空缓存结果。")
-        st.rerun()
-with tools_right:
-    st.markdown(
-        """
-        <div class="smallMuted">
-        提示：示例数据可一键跑通全流程；若用上传数据，请确保 RNA 列名（样本名）能与 labels 的 Sample 对齐。
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# =====================================================
 # Uploaders + RUN (Anchor: run)
 # =====================================================
 st.markdown('<div id="run"></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("### 数据输入")
+
 u1, u2, u3 = st.columns(3)
 with u1:
     rna_file = st.file_uploader("RNA-seq（genes×samples）CSV（可选）", type="csv", key="rna_uploader")
@@ -938,26 +943,6 @@ with u3:
     surv_file = st.file_uploader("Survival CSV（Sample,Time,Event，可选）", type="csv", key="surv_uploader")
 
 use_demo_data = st.checkbox("本次运行使用示例数据（忽略上传）", value=True)
-
-with st.expander("📎 数据格式示例 / 预览（建议先看）", expanded=False):
-    st.markdown("**RNA (genes×samples) 示例：**")
-    st.dataframe(
-        pd.DataFrame({"Gene": ["TP53", "EGFR", "BRCA1"], "S1": [3.2, 0.1, 1.7], "S2": [2.9, 0.2, 1.4]}).set_index("Gene"),
-        use_container_width=True,
-    )
-    st.markdown("**Labels 示例：**")
-    st.dataframe(pd.DataFrame({"Sample": ["S1", "S2"], "Label": [0, 1]}), use_container_width=True)
-    st.markdown("**Survival 示例：**")
-    st.dataframe(pd.DataFrame({"Sample": ["S1", "S2"], "Time": [120, 340], "Event": [1, 0]}), use_container_width=True)
-
-    if (not use_demo_data) and (rna_file is not None) and (label_file is not None):
-        try:
-            st.markdown("**你上传的 RNA 前 5 行：**")
-            st.dataframe(read_csv_cached(rna_file).head(5), use_container_width=True)
-            st.markdown("**你上传的 Labels 前 5 行：**")
-            st.dataframe(read_csv_cached(label_file).head(5), use_container_width=True)
-        except Exception as e:
-            st.warning(f"预览失败：{e}")
 
 run_button = st.button("🚀 运行主流程", type="primary")
 st.markdown("</div>", unsafe_allow_html=True)
@@ -1165,6 +1150,7 @@ if run_button:
 
     top20_genes = stability_df.sort_values("MeanImportance", ascending=False)["Gene"].head(20).tolist()
 
+    # cache
     st.session_state["cache_rna"] = rna
     st.session_state["cache_labels"] = labels
     st.session_state["cache_align_info"] = align_info
@@ -1180,12 +1166,14 @@ if run_button:
 
     st.session_state["cache_cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # artifacts
     artifact_put_df_csv("model_metrics_all_runs.csv", metrics_df, note="每次 run 的指标")
     artifact_put_df_csv("model_metrics_summary.csv", summary_df, note="指标均值±标准差")
     artifact_put_df_csv("latent_shap_gene_importance_stability.csv", stability_df, note="基因稳定性（Mean/CV/Freq）")
     if isinstance(last_latent_df, pd.DataFrame):
         artifact_put_df_csv("latent_mean_abs_shap.csv", last_latent_df, note="latent 维度 MeanAbsSHAP")
 
+    # shap figs to artifact (best-effort)
     try:
         if last_shap_z is not None and last_z_test is not None:
             fig1 = plt.figure(figsize=(9.5, 5.5))
@@ -1210,6 +1198,7 @@ if run_button:
     except Exception:
         pass
 
+    # clear downstream caches
     for k in [
         "cache_enrich_go_kegg",
         "cache_de_df",
@@ -1221,7 +1210,6 @@ if run_button:
         st.session_state.pop(k, None)
 
     st.success("✅ 主流程运行完成：结果已缓存（切换 Tabs / 下载不会丢失）。")
-    # 刷新顶部工具栏状态
     st.rerun()
 
 # =====================================================
@@ -1236,13 +1224,25 @@ if "cache_metrics_df" in st.session_state:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.markdown(f"""<div class="kpi"><div class="label">Runs</div><div class="value">{len(st.session_state["cache_metrics_df"])}</div><div class="hint">重复训练次数</div></div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="kpi"><div class="label">Runs</div><div class="value">{len(st.session_state["cache_metrics_df"])}</div><div class="hint">重复训练次数</div></div>""",
+            unsafe_allow_html=True,
+        )
     with k2:
-        st.markdown(f"""<div class="kpi"><div class="label">AUC (mean)</div><div class="value">{auc_mean:.3f}</div><div class="hint">测试集平均 AUC</div></div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="kpi"><div class="label">AUC (mean)</div><div class="value">{auc_mean:.3f}</div><div class="hint">测试集平均 AUC</div></div>""",
+            unsafe_allow_html=True,
+        )
     with k3:
-        st.markdown(f"""<div class="kpi"><div class="label">Accuracy (mean)</div><div class="value">{acc_mean:.3f}</div><div class="hint">测试集平均准确率</div></div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="kpi"><div class="label">Accuracy (mean)</div><div class="value">{acc_mean:.3f}</div><div class="hint">测试集平均准确率</div></div>""",
+            unsafe_allow_html=True,
+        )
     with k4:
-        st.markdown(f"""<div class="kpi"><div class="label">Top biomarkers</div><div class="value">{len(top20)}</div><div class="hint">用于下游分析</div></div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="kpi"><div class="label">Top biomarkers</div><div class="value">{len(top20)}</div><div class="hint">用于下游分析</div></div>""",
+            unsafe_allow_html=True,
+        )
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
@@ -1252,22 +1252,15 @@ st.divider()
 # =====================================================
 tabs = st.tabs(["① 主流程", "② 下载中心", "③ GO/KEGG", "④ 差异分析", "⑤ 聚类&生存"])
 
+
 def _need_run():
     st.info("请先运行主流程（点击上方 🚀 运行主流程）。")
+
 
 # ---------------- Tab ① 主流程 ----------------
 with tabs[0]:
     st.markdown('<div id="main"></div>', unsafe_allow_html=True)
     st.subheader("① 主流程（性能 / 稳定性 / SHAP）")
-
-    st.markdown(
-        """
-        <div class="card smallMuted">
-          建议流程：先运行主流程 → 看 Top20 与稳定性 → 再做 GO/KEGG 或差异分析 → 最后做聚类与生存验证。
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     if "cache_stability_df" not in st.session_state:
         _need_run()
@@ -1323,15 +1316,6 @@ with tabs[1]:
     if "cache_stability_df" not in st.session_state:
         _need_run()
     else:
-        st.markdown(
-            """
-            <div class="card smallMuted">
-              下载建议：单文件用于快速导出；ZIP 用于一次性打包（含 REPORT.md + 图 + 表）。
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("#### 📦 结果文件列表（当前 session）")
         table = artifact_table_df()
@@ -1412,7 +1396,7 @@ with tabs[2]:
                     )
                     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Tab ④ 差异分析 ----------------
+# ---------------- Tab ④ 差异分析（含箱线图） ----------------
 with tabs[3]:
     st.markdown('<div id="de"></div>', unsafe_allow_html=True)
     st.subheader("④ 差异分析（labels 两组，Top20）")
@@ -1476,6 +1460,29 @@ with tabs[3]:
             artifact_put_fig_png("de_volcano_top20.png", figv, note="Volcano plot (Top20)")
             plt.close(figv)
             st.markdown("</div>", unsafe_allow_html=True)
+
+        # ===== 箱线图模块（无论是否跑 DE 都可画）=====
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### 📦 Top 基因表达箱线图（按 Label 分组）")
+        default_sel = top_genes[:6]  # 默认 6 个更清晰
+        sel_genes = st.multiselect(
+            "选择要画的基因（建议 3~10 个更清晰）",
+            options=top_genes,
+            default=default_sel,
+        )
+        save_png = st.checkbox("把箱线图加入下载中心（PNG）", value=True)
+
+        if st.button("📈 生成箱线图", type="primary"):
+            try:
+                fig_box = plot_gene_boxplots(rna, labels, sel_genes)
+                st.pyplot(fig_box)
+                if save_png:
+                    artifact_put_fig_png("top_genes_boxplots.png", fig_box, note="Boxplots by Label (selected genes)")
+                plt.close(fig_box)
+            except Exception as e:
+                st.error(f"箱线图生成失败：{e}")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------- Tab ⑤ 聚类 & 生存 ----------------
 with tabs[4]:
