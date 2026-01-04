@@ -10,6 +10,10 @@
 #   - 模块导航：按钮（替代 Tabs）
 #   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md（不依赖 tabulate）
 #   - 清除缓存：一键清空运行结果与下载缓存
+#
+# CHANGE:
+#   - 选中模块按钮（“Tabs”替代按钮）颜色更明显
+#   - 不使用对号 ✅（选中态不显示任何对号/标记）
 # =====================================================
 
 import os
@@ -577,39 +581,12 @@ def artifact_table_df():
 
 
 # =====================================================
-# Cache clear (NEW)
+# Cache clear
 # =====================================================
-RESULT_KEYS_PREFIX = (
-    "cache_rna",
-    "cache_labels",
-    "cache_top20_genes",
-    "cache_metrics_df",
-    "cache_summary_df",
-    "cache_stability_df",
-    "cache_latent_df",
-    "cache_last_shap_z",
-    "cache_last_z_test",
-    "cache_cached_at",
-    "cache_data_source",
-    "cache_params",
-    "cache_artifacts",
-    "cache_fig_pngs",
-    "cache_demo_surv_raw",
-    "cache_enrich_go_kegg",
-    "cache_enrich_lib_idx",
-    "cache_de_df",
-    "cache_de_groups",
-    "cache_cluster_df",
-    "cache_cluster_X_scaled",
-    "cache_cox_cluster_summary",
-)
-
 def clear_results_cache():
-    # 清除运行结果与下载缓存，不动 “use_demo_gate / page”等 UI 控制
     for k in list(st.session_state.keys()):
         if k.startswith("cache_"):
             st.session_state.pop(k, None)
-    # 也清一下 st.cache_data 的缓存（读 CSV 的缓存）
     try:
         st.cache_data.clear()
     except Exception:
@@ -658,14 +635,14 @@ class MLP(nn.Module):
 
 
 # =====================================================
-# Sticky Toolbar
+# Sticky Toolbar (anchor nav + scroll highlight)
 # =====================================================
 def render_sticky_toolbar():
     run_ok = "cache_stability_df" in st.session_state
     data_source = st.session_state.get("cache_data_source", "未运行")
     cached_at = st.session_state.get("cache_cached_at", "")
 
-    status_badge = "✅ 已运行" if run_ok else "⚠️ 未运行"
+    status_badge = "已运行" if run_ok else "未运行"
     status_color = "#16A34A" if run_ok else "#F59E0B"
 
     html = f"""
@@ -711,10 +688,13 @@ def render_sticky_toolbar():
       }}
       .btn:hover {{ background: rgba(246,248,252,0.95); transform: translateY(-1px); }}
       .btn.primary {{ border-color: rgba(46,125,255,0.35); background: rgba(46,125,255,0.10); }}
+
+      /* highlight by scroll (active) */
       .btn.active {{
-        border-color: rgba(46,125,255,0.55);
-        background: rgba(46,125,255,0.18);
-        box-shadow: 0 1px 10px rgba(46,125,255,0.10);
+        border-color: rgba(37,99,235,0.60);
+        background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(59,130,246,0.14));
+        box-shadow: 0 10px 22px rgba(37,99,235,0.16);
+        color: #1D4ED8;
       }}
       .muted {{ opacity:0.65; font-size:12px; white-space:nowrap; }}
       .sep {{ width:1px; height:20px; background: rgba(15,23,42,0.10); margin:0 4px; }}
@@ -830,14 +810,37 @@ st.markdown(
       .smallMuted { opacity: 0.70; font-size: 0.90rem; }
       .stDataFrame { border-radius: 12px; overflow: hidden; }
 
-      .navbtn-wrap { display:flex; gap:10px; flex-wrap: wrap; margin: 8px 0 12px 0; }
+      /* ---- module buttons: make active state obvious; no checkmark used ---- */
+      .modbtn-row { display:flex; gap:10px; flex-wrap: wrap; margin: 8px 0 12px 0; }
+      /* Streamlit button styling hook (best-effort) */
+      div[data-testid="stButton"] > button.modbtn {
+        border: 1px solid rgba(15,23,42,0.14) !important;
+        background: rgba(255,255,255,0.72) !important;
+        color: #0F172A !important;
+        border-radius: 14px !important;
+        padding: 0.55rem 0.8rem !important;
+        font-weight: 800 !important;
+        transition: all .14s ease !important;
+      }
+      div[data-testid="stButton"] > button.modbtn:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 10px 22px rgba(2,6,23,0.06) !important;
+        border-color: rgba(37,99,235,0.35) !important;
+        background: rgba(246,248,252,0.96) !important;
+      }
+      div[data-testid="stButton"] > button.modbtn.active {
+        border-color: rgba(37,99,235,0.60) !important;
+        background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(59,130,246,0.14)) !important;
+        box-shadow: 0 12px 26px rgba(37,99,235,0.16) !important;
+        color: #1D4ED8 !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析平台")
-st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集（单页切换+气泡图）→ 差异分析（含箱线图）→ 聚类与生存验证")
+st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集（按钮切换+气泡图）→ 差异分析（含箱线图）→ 聚类与生存验证")
 
 
 # =====================================================
@@ -900,7 +903,7 @@ with st.sidebar:
 
 
 # =====================================================
-# Hero section: Input / Workflow / Output (RESTORED)
+# Hero section: Input / Workflow / Output
 # =====================================================
 st.markdown('<div class="heroWrap">', unsafe_allow_html=True)
 st.markdown('<div class="heroTitle">一站式 Biomarker 发现与验证</div>', unsafe_allow_html=True)
@@ -1074,7 +1077,8 @@ if run_button:
             mlp = MLP(int(latent_dim))
             optimizer = optim.Adam(list(vae.parameters()) + list(mlp.parameters()), lr=float(lr))
 
-            vae.train(); mlp.train()
+            vae.train()
+            mlp.train()
             for _ in range(int(n_epochs)):
                 optimizer.zero_grad()
                 z, mean, log_var = vae(X_train_t)
@@ -1085,7 +1089,8 @@ if run_button:
                 loss.backward()
                 optimizer.step()
 
-            vae.eval(); mlp.eval()
+            vae.eval()
+            mlp.eval()
             with torch.no_grad():
                 z_test, _, _ = vae(X_test_t)
                 y_pred_test = mlp(z_test).cpu().numpy().flatten()
@@ -1143,7 +1148,8 @@ if run_button:
 
             prog.progress((run_i + 1) / int(n_runs))
 
-    status.empty(); prog.empty()
+    status.empty()
+    prog.empty()
 
     metrics_df = pd.DataFrame(metrics_runs)
     summary_df = metrics_df[["AUC", "Accuracy", "Precision", "Recall"]].agg(["mean", "std"]).T.reset_index()
@@ -1217,7 +1223,7 @@ if run_button:
 
     # default page
     st.session_state["page"] = "主流程"
-    st.success("✅ 主流程运行完成：结果已缓存。")
+    st.success("✅ 主流程运行完成：结果已缓存（切换页面/下载不会丢失）。")
     st.rerun()
 
 
@@ -1256,29 +1262,65 @@ if "cache_metrics_df" in st.session_state:
 
 
 # =====================================================
-# Button Navigation (replaces Tabs)
+# Button Navigation (replaces Tabs) — NO CHECKMARK
 # =====================================================
 PAGES = ["主流程", "下载中心", "功能富集", "差异分析", "聚类&生存"]
-PAGE_TO_ANCHOR = {
-    "主流程": "main",
-    "下载中心": "download",
-    "功能富集": "enrich",
-    "差异分析": "de",
-    "聚类&生存": "survival",
-}
 if "page" not in st.session_state:
     st.session_state["page"] = "主流程"
 
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("### 模块导航（按钮）")
+
 cols = st.columns([1, 1, 1, 1, 1])
 for i, p in enumerate(PAGES):
     with cols[i]:
         is_active = (st.session_state["page"] == p)
-        label = f"✅ {p}" if is_active else p
-        if st.button(label, use_container_width=True, key=f"nav_{p}"):
+
+        # 关键：不加 ✅，仅用颜色区分
+        btn_label = p
+
+        # 用 key 区分；并用 JS 给当前按钮加 class active（CSS 控制明显颜色）
+        clicked = st.button(btn_label, use_container_width=True, key=f"nav_{p}")
+        if clicked:
             st.session_state["page"] = p
             st.rerun()
+
+        # 给渲染出来的“最后一个按钮”打标签不太可靠，采用 JS：按文本匹配并给 active 加 class
+        # 这段每次都会跑一遍，确保当前选中态生效
+        if is_active:
+            components.html(
+                f"""
+                <script>
+                  const btns = parent.document.querySelectorAll('button');
+                  btns.forEach(b => {{
+                    if (b.innerText.trim() === "{p}") {{
+                      b.classList.add("modbtn");
+                      b.classList.add("active");
+                    }} else if (b.classList.contains("modbtn")) {{
+                      // 只移除 modbtn 的 active，不影响其他按钮
+                      b.classList.remove("active");
+                    }}
+                  }});
+                </script>
+                """,
+                height=0,
+            )
+        else:
+            # ensure modbtn class exists for consistent style
+            components.html(
+                f"""
+                <script>
+                  const btns = parent.document.querySelectorAll('button');
+                  btns.forEach(b => {{
+                    if (b.innerText.trim() === "{p}") {{
+                      b.classList.add("modbtn");
+                    }}
+                  }});
+                </script>
+                """,
+                height=0,
+            )
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1423,7 +1465,6 @@ def render_enrich():
     idx = max(0, min(idx, len(libs) - 1))
     st.session_state["cache_enrich_lib_idx"] = idx
 
-    # Prev / Next
     st.markdown('<div class="card">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
     with c1:
@@ -1453,7 +1494,7 @@ def render_enrich():
         df_show = df.head(int(top_n))
     st.dataframe(df_show, use_container_width=True, height=360)
 
-    st.markdown("#### 🫧 气泡图（Top）")
+    st.markdown("#### 气泡图（Top）")
     try:
         figb = plot_enrich_bubble(df, title=f"Enrichr Bubble: {lib}", top_n=int(top_n))
         st.pyplot(figb)
