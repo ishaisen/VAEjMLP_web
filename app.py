@@ -1,12 +1,15 @@
 # =====================================================
 # app.py (FULL REPLACEABLE VERSION)
-# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + GO/KEGG + DE(含箱线图) + 聚类 + 生存
+# VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + GO/KEGG(按钮切换+气泡图)
+# + DE(含箱线图) + 聚类 + 生存
 #
 # UI:
 #   - Demo gate（未开启时仅显示开关）
-#   - Hero 卡片 + 统一 card / KPI
+#   - Hero: Input / Workflow / Output
+#   - 顶部 Sticky Toolbar（锚点跳转+回到顶部+模块高亮）
+#   - 模块导航：按钮（替代 Tabs）
 #   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md（不依赖 tabulate）
-#   - Sticky Toolbar（固定顶部 + 锚点跳转 + Tab 高亮 + 回到顶部）
+#   - 清除缓存：一键清空运行结果与下载缓存
 # =====================================================
 
 import os
@@ -124,11 +127,6 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_labels_df(labels_raw: pd.DataFrame):
-    """
-    返回：
-      labels_df: 标准化后的 DataFrame（Sample/Label）
-      detect_info: dict，记录识别出来的列名信息
-    """
     labels = clean_columns(labels_raw.copy())
     if labels.shape[1] < 2:
         raise ValueError("Label 文件至少需要两列（样本列 + 标签列）。")
@@ -168,10 +166,6 @@ def normalize_labels_df(labels_raw: pd.DataFrame):
 
 
 def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
-    """
-    返回：
-      rna_aligned, labels_aligned, align_info, label_detect_info
-    """
     rna = safe_rename_index_col(rna_raw.copy())
     rna = clean_columns(rna)
     rna.columns = rna.columns.astype(str)
@@ -205,9 +199,6 @@ def align_rna_labels(rna_raw: pd.DataFrame, labels_raw: pd.DataFrame):
 
 
 def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
-    """
-    兼容 shap 返回 list / ndarray / (n, d, 1) 等情况，最终保证 (n, d)
-    """
     if isinstance(shap_values, list):
         shap_z = shap_values[0]
     else:
@@ -229,7 +220,6 @@ def ensure_2d_shap(shap_values, features_2d: np.ndarray) -> np.ndarray:
 
 
 def df_to_markdown_fallback(df: pd.DataFrame) -> str:
-    """不依赖 tabulate 的 DataFrame -> Markdown 表格"""
     df2 = df.copy().fillna("")
     cols = [str(c) for c in df2.columns.tolist()]
     header = "| " + " | ".join(cols) + " |"
@@ -240,6 +230,7 @@ def df_to_markdown_fallback(df: pd.DataFrame) -> str:
     return "\n".join([header, sep] + rows)
 
 
+# ---------------- DE ----------------
 def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: list):
     if not SCIPY_OK:
         raise RuntimeError("缺少 scipy，无法做 t-test。请安装：pip install scipy")
@@ -296,11 +287,6 @@ def compute_de_top_genes(rna: pd.DataFrame, labels: pd.DataFrame, top_genes: lis
 
 
 def plot_gene_boxplots(rna: pd.DataFrame, labels: pd.DataFrame, genes: list, group_order=None):
-    """
-    rna: genes x samples
-    labels: 必须含 Sample/Label
-    genes: 要画的基因列表
-    """
     rna = clean_columns(rna.copy())
     rna.columns = rna.columns.astype(str)
 
@@ -350,6 +336,7 @@ def plot_gene_boxplots(rna: pd.DataFrame, labels: pd.DataFrame, genes: list, gro
     return fig
 
 
+# ---------------- Enrich ----------------
 def run_enrichr(top_genes: list, organism: str = "Human"):
     if not GSEAPY_OK:
         raise RuntimeError("缺少 gseapy，无法做 GO/KEGG。请安装：pip install gseapy")
@@ -376,6 +363,69 @@ def run_enrichr(top_genes: list, organism: str = "Human"):
     return out
 
 
+def _pick_col(df: pd.DataFrame, candidates: list, default=None):
+    cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols:
+            return cols[cand.lower()]
+    return default
+
+
+def plot_enrich_bubble(df: pd.DataFrame, title: str, top_n: int = 20):
+    if df is None or len(df) == 0:
+        raise ValueError("富集结果为空，无法绘图。")
+
+    term_col = _pick_col(df, ["Term", "term"], default=df.columns[0])
+    adjp_col = _pick_col(df, ["Adjusted P-value", "Adjusted P-value "])
+    p_col = _pick_col(df, ["P-value", "p_value", "p-value"])
+    comb_col = _pick_col(df, ["Combined Score", "combined_score", "Combined Score "])
+
+    d = df.copy()
+    if adjp_col is not None:
+        d = d.sort_values(adjp_col, ascending=True)
+    elif p_col is not None:
+        d = d.sort_values(p_col, ascending=True)
+
+    d = d.head(int(top_n)).copy()
+    d[term_col] = d[term_col].astype(str)
+
+    eps = 1e-300
+    if adjp_col is not None:
+        d["_adjp"] = pd.to_numeric(d[adjp_col], errors="coerce").fillna(1.0)
+    elif p_col is not None:
+        d["_adjp"] = pd.to_numeric(d[p_col], errors="coerce").fillna(1.0)
+    else:
+        d["_adjp"] = 1.0
+
+    d["_mlog10"] = -np.log10(d["_adjp"].values + eps)
+
+    if comb_col is not None:
+        d["_x"] = pd.to_numeric(d[comb_col], errors="coerce").fillna(d["_mlog10"])
+        x_label = comb_col
+    else:
+        d["_x"] = d["_mlog10"]
+        x_label = "-log10(p_adj)"
+
+    y_labels = d[term_col].tolist()[::-1]
+    x = d["_x"].values[::-1]
+    size = (d["_mlog10"].values[::-1] + 1.0) ** 2 * 12
+    color = d["_adjp"].values[::-1]
+
+    fig = plt.figure(figsize=(9.5, max(4.2, 0.28 * len(y_labels) + 1.8)))
+    ax = plt.gca()
+    sc = ax.scatter(x, range(len(y_labels)), s=size, c=color)
+    ax.set_yticks(range(len(y_labels)))
+    ax.set_yticklabels(y_labels, fontsize=9)
+    ax.set_xlabel(x_label)
+    ax.set_title(title)
+    ax.grid(True, axis="x", alpha=0.25)
+    cbar = plt.colorbar(sc)
+    cbar.set_label("Adjusted P-value (smaller = better)")
+    plt.tight_layout()
+    return fig
+
+
+# ---------------- Cluster/Survival ----------------
 def cluster_samples_by_top_genes(rna: pd.DataFrame, top_genes: list, n_clusters: int = 2, seed: int = 42):
     rna = clean_columns(rna.copy())
     rna.columns = rna.columns.astype(str)
@@ -433,7 +483,7 @@ def km_plot_by_group(surv_df: pd.DataFrame, group_col: str, time_col: str = "Tim
 # =====================================================
 def artifacts_init():
     if "cache_artifacts" not in st.session_state:
-        st.session_state["cache_artifacts"] = {}  # name -> dict(bytes, mime, kind, note)
+        st.session_state["cache_artifacts"] = {}
     if "cache_fig_pngs" not in st.session_state:
         st.session_state["cache_fig_pngs"] = {}
 
@@ -493,7 +543,6 @@ def build_report_md() -> str:
     md.append("- GO/KEGG requires gseapy and network access to Enrichr.\n")
     md.append("- DE requires scipy + statsmodels.\n")
     md.append("- Survival requires lifelines.\n")
-
     return "".join(md)
 
 
@@ -512,7 +561,6 @@ def build_results_zip(ts: str) -> bytes:
             "artifact_count": len(st.session_state["cache_artifacts"]),
         }
         zf.writestr("README_metadata.json", pd.Series(meta).to_json())
-
     zbuf.seek(0)
     return zbuf.read()
 
@@ -529,7 +577,47 @@ def artifact_table_df():
 
 
 # =====================================================
-# Model
+# Cache clear (NEW)
+# =====================================================
+RESULT_KEYS_PREFIX = (
+    "cache_rna",
+    "cache_labels",
+    "cache_top20_genes",
+    "cache_metrics_df",
+    "cache_summary_df",
+    "cache_stability_df",
+    "cache_latent_df",
+    "cache_last_shap_z",
+    "cache_last_z_test",
+    "cache_cached_at",
+    "cache_data_source",
+    "cache_params",
+    "cache_artifacts",
+    "cache_fig_pngs",
+    "cache_demo_surv_raw",
+    "cache_enrich_go_kegg",
+    "cache_enrich_lib_idx",
+    "cache_de_df",
+    "cache_de_groups",
+    "cache_cluster_df",
+    "cache_cluster_X_scaled",
+    "cache_cox_cluster_summary",
+)
+
+def clear_results_cache():
+    # 清除运行结果与下载缓存，不动 “use_demo_gate / page”等 UI 控制
+    for k in list(st.session_state.keys()):
+        if k.startswith("cache_"):
+            st.session_state.pop(k, None)
+    # 也清一下 st.cache_data 的缓存（读 CSV 的缓存）
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+# =====================================================
+# Models
 # =====================================================
 class VAE(nn.Module):
     def __init__(self, input_dim, latent_dim):
@@ -570,7 +658,7 @@ class MLP(nn.Module):
 
 
 # =====================================================
-# Sticky Toolbar (Active highlight + Back to top)
+# Sticky Toolbar
 # =====================================================
 def render_sticky_toolbar():
     run_ok = "cache_stability_df" in st.session_state
@@ -582,8 +670,7 @@ def render_sticky_toolbar():
 
     html = f"""
     <style>
-      .block-container {{ padding-top: 5.8rem; }}
-
+      .block-container {{ padding-top: 6.6rem; }}
       .stickybar {{
         position: fixed;
         top: 0; left: 0; right: 0;
@@ -602,82 +689,35 @@ def render_sticky_toolbar():
         gap: 14px;
         font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
       }}
-      .left {{
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        min-width: 320px;
-        flex-wrap: wrap;
-      }}
-      .brand {{
-        font-weight: 800;
-        letter-spacing: -0.02em;
-        color: #0F172A;
-        font-size: 14px;
-        white-space: nowrap;
-      }}
+      .left {{ display:flex; align-items:center; gap:10px; min-width: 320px; flex-wrap: wrap; }}
+      .brand {{ font-weight:800; letter-spacing:-0.02em; color:#0F172A; font-size:14px; white-space:nowrap; }}
       .badge {{
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 10px;
-        border-radius: 999px;
+        display:inline-flex; align-items:center; gap:6px;
+        padding:6px 10px; border-radius:999px;
         border: 1px solid rgba(15,23,42,0.12);
         background: rgba(255,255,255,0.70);
-        font-size: 12px;
-        white-space: nowrap;
+        font-size:12px; white-space:nowrap;
       }}
-      .dot {{
-        width: 8px; height: 8px;
-        border-radius: 999px;
-        background: {status_color};
-        display: inline-block;
-      }}
-      .right {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-        justify-content: flex-end;
-      }}
+      .dot {{ width:8px; height:8px; border-radius:999px; background:{status_color}; display:inline-block; }}
+      .right {{ display:flex; align-items:center; gap:8px; flex-wrap: wrap; justify-content:flex-end; }}
       .btn {{
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 10px;
-        border-radius: 10px;
+        display:inline-flex; align-items:center; gap:8px;
+        padding:8px 10px; border-radius:10px;
         border: 1px solid rgba(15,23,42,0.12);
         background: rgba(255,255,255,0.70);
-        color: #0F172A;
-        text-decoration: none;
-        font-size: 12px;
-        cursor: pointer;
-        transition: all .12s ease;
-        user-select: none;
+        color:#0F172A; text-decoration:none;
+        font-size:12px; cursor:pointer;
+        transition: all .12s ease; user-select:none;
       }}
-      .btn:hover {{
-        background: rgba(246,248,252,0.95);
-        transform: translateY(-1px);
-      }}
-      .btn.primary {{
-        border-color: rgba(46,125,255,0.35);
-        background: rgba(46,125,255,0.10);
-      }}
+      .btn:hover {{ background: rgba(246,248,252,0.95); transform: translateY(-1px); }}
+      .btn.primary {{ border-color: rgba(46,125,255,0.35); background: rgba(46,125,255,0.10); }}
       .btn.active {{
         border-color: rgba(46,125,255,0.55);
         background: rgba(46,125,255,0.18);
         box-shadow: 0 1px 10px rgba(46,125,255,0.10);
       }}
-      .muted {{
-        opacity: 0.65;
-        font-size: 12px;
-        white-space: nowrap;
-      }}
-      .sep {{
-        width: 1px; height: 20px;
-        background: rgba(15,23,42,0.10);
-        margin: 0 4px;
-      }}
+      .muted {{ opacity:0.65; font-size:12px; white-space:nowrap; }}
+      .sep {{ width:1px; height:20px; background: rgba(15,23,42,0.10); margin:0 4px; }}
     </style>
 
     <div class="stickybar">
@@ -699,7 +739,7 @@ def render_sticky_toolbar():
           <a class="btn nav" id="nav-survival" href="#survival">⑤ 生存</a>
           <div class="sep"></div>
           <a class="btn" href="#top">⬆ 回到顶部</a>
-          <span class="muted">滚动到模块会高亮</span>
+          <span class="muted">滚动高亮</span>
         </div>
       </div>
     </div>
@@ -712,7 +752,6 @@ def render_sticky_toolbar():
         ["de", "nav-de"],
         ["survival", "nav-survival"],
       ];
-
       function setActive(btnId) {{
         sections.forEach(([sec, id]) => {{
           const el = document.getElementById(id);
@@ -721,26 +760,20 @@ def render_sticky_toolbar():
         const active = document.getElementById(btnId);
         if (active) active.classList.add("active");
       }}
-
       sections.forEach(([secId, btnId]) => {{
         const target = document.getElementById(secId);
         if (!target) return;
-
         const obs = new IntersectionObserver((entries) => {{
           entries.forEach(entry => {{
-            if (entry.isIntersecting) {{
-              setActive(btnId);
-            }}
+            if (entry.isIntersecting) setActive(btnId);
           }});
         }}, {{
           root: null,
           threshold: 0.01,
           rootMargin: "-35% 0px -60% 0px"
         }});
-
         obs.observe(target);
       }});
-
       setActive("nav-main");
     </script>
     """
@@ -751,12 +784,9 @@ def render_sticky_toolbar():
 # Page + Styles
 # =====================================================
 st.set_page_config(page_title="VAEjMLP latent-SHAP BioApp", layout="wide")
-
-# ---- Anchors: top ----
 st.markdown('<div id="top"></div>', unsafe_allow_html=True)
-
-# ---- Sticky toolbar FIRST ----
 render_sticky_toolbar()
+artifacts_init()
 
 st.markdown(
     """
@@ -798,26 +828,31 @@ st.markdown(
       .kpi .hint  { font-size: 0.8rem; opacity: 0.55; margin-top: 6px; }
 
       .smallMuted { opacity: 0.70; font-size: 0.90rem; }
-
       .stDataFrame { border-radius: 12px; overflow: hidden; }
+
+      .navbtn-wrap { display:flex; gap:10px; flex-wrap: wrap; margin: 8px 0 12px 0; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.title("🧬 VAEjMLP + latent SHAP 生物标志物分析平台")
-st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集 → 差异分析（含箱线图）→ 聚类与生存验证")
+st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → 功能富集（单页切换+气泡图）→ 差异分析（含箱线图）→ 聚类与生存验证")
 
-artifacts_init()
 
 # =====================================================
-# Gate: only demo switch visible until enabled
+# Sidebar: Demo gate + Clear cache
 # =====================================================
 with st.sidebar:
     st.header("示例数据")
     use_demo_gate = st.checkbox("使用示例数据（Demo）", value=False)
-    if not use_demo_gate:
-        st.info("当前仅显示此开关。打开后才显示完整功能与参数。")
+    st.divider()
+    st.header("缓存管理")
+    if st.button("🧹 清除缓存 / 清除结果", use_container_width=True):
+        clear_results_cache()
+        st.success("已清除运行结果与下载缓存。")
+        st.rerun()
+    st.caption("说明：清除不会影响页面开关，只会清掉已运行结果与下载文件缓存。")
 
 if not use_demo_gate:
     st.markdown(
@@ -829,16 +864,13 @@ if not use_demo_gate:
             使用 <b>latent SHAP</b> 解释模型决策并映射回基因层形成候选 biomarkers；
             支持多次运行做稳定性评估（频率/CV）；并对 Top20 做富集、差异（含箱线图）、聚类及生存验证。
           </div>
-          <ul class="smallMuted" style="margin-top:10px;">
-            <li><b>输入</b>：RNA、labels（Sample/Label）、（可选）survival（Sample/Time/Event）</li>
-            <li><b>输出</b>：性能指标、Top biomarkers、稳定性、SHAP、富集/差异/聚类/生存、下载</li>
-          </ul>
-          <div class="smallMuted">👉 请在左侧打开「使用示例数据（Demo）」进入完整页面。</div>
+          <div class="smallMuted" style="margin-top:10px;">👉 请在左侧打开「使用示例数据（Demo）」进入完整页面。</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.stop()
+
 
 # =====================================================
 # Sidebar: parameters
@@ -846,7 +878,6 @@ if not use_demo_gate:
 with st.sidebar:
     st.divider()
     st.header("主流程参数")
-
     latent_dim = st.number_input("latent_dim", min_value=4, max_value=1024, value=128, step=4)
     n_epochs = st.number_input("训练轮数 epochs", min_value=10, max_value=2000, value=100, step=10)
     lr = st.number_input("学习率 lr", min_value=1e-5, max_value=1e-1, value=1e-3, step=1e-4, format="%.5f")
@@ -867,8 +898,9 @@ with st.sidebar:
     cluster_k = st.slider("聚类簇数 K", 2, 6, 2)
     cox_penalizer = st.number_input("Cox L2 penalizer", min_value=0.0, max_value=10.0, value=0.1, step=0.1)
 
+
 # =====================================================
-# Hero cards
+# Hero section: Input / Workflow / Output (RESTORED)
 # =====================================================
 st.markdown('<div class="heroWrap">', unsafe_allow_html=True)
 st.markdown('<div class="heroTitle">一站式 Biomarker 发现与验证</div>', unsafe_allow_html=True)
@@ -923,14 +955,13 @@ with hc3:
         """,
         unsafe_allow_html=True,
     )
-
 st.markdown("</div>", unsafe_allow_html=True)
+
 
 # =====================================================
 # Uploaders + RUN (Anchor: run)
 # =====================================================
 st.markdown('<div id="run"></div>', unsafe_allow_html=True)
-
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("### 数据输入")
 
@@ -943,9 +974,9 @@ with u3:
     surv_file = st.file_uploader("Survival CSV（Sample,Time,Event，可选）", type="csv", key="surv_uploader")
 
 use_demo_data = st.checkbox("本次运行使用示例数据（忽略上传）", value=True)
-
 run_button = st.button("🚀 运行主流程", type="primary")
 st.markdown("</div>", unsafe_allow_html=True)
+
 
 # =====================================================
 # Main pipeline
@@ -982,22 +1013,16 @@ if run_button:
             rna_raw = read_csv_path_cached(rna_path)
             labels_raw = read_csv_path_cached(lab_path)
 
-        if os.path.exists(sur_path):
-            st.session_state["cache_demo_surv_raw"] = read_csv_path_cached(sur_path)
-        else:
-            st.session_state["cache_demo_surv_raw"] = None
-
+        st.session_state["cache_demo_surv_raw"] = read_csv_path_cached(sur_path) if os.path.exists(sur_path) else None
         st.session_state["cache_data_source"] = "Demo"
     else:
         st.session_state["cache_demo_surv_raw"] = None
         if rna_file is None or label_file is None:
             st.error("未选择示例数据时，必须上传 RNA 与 Label。")
             st.stop()
-
         with st.spinner("读取上传数据中..."):
             rna_raw = read_csv_cached(rna_file)
             labels_raw = read_csv_cached(label_file)
-
         st.session_state["cache_data_source"] = "Upload"
 
     with st.spinner("对齐样本与列识别中..."):
@@ -1010,17 +1035,12 @@ if run_button:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### ✅ 输入检查与对齐信息")
     st.write({
-        "Label 列识别": label_detect,
         "样本对齐": align_info,
         "对齐后 RNA 维度 (genes×samples)": f"{rna.shape[0]} × {rna.shape[1]}",
     })
     if align_info.get("took_intersection", False):
         st.warning("RNA 与 Labels 样本不完全一致：已自动取交集并按 RNA 列顺序对齐。")
     st.markdown("</div>", unsafe_allow_html=True)
-
-    if rna.shape[0] < 2 or rna.shape[1] < 4:
-        st.error("RNA 维度不满足：需要 genes×samples，且样本数至少 4。")
-        st.stop()
 
     genes = rna.index.astype(str).tolist()
     y = labels["Label"].values
@@ -1153,9 +1173,6 @@ if run_button:
     # cache
     st.session_state["cache_rna"] = rna
     st.session_state["cache_labels"] = labels
-    st.session_state["cache_align_info"] = align_info
-    st.session_state["cache_label_detect"] = label_detect
-
     st.session_state["cache_top20_genes"] = top20_genes
     st.session_state["cache_metrics_df"] = metrics_df
     st.session_state["cache_summary_df"] = summary_df
@@ -1163,7 +1180,6 @@ if run_button:
     st.session_state["cache_latent_df"] = last_latent_df
     st.session_state["cache_last_shap_z"] = last_shap_z
     st.session_state["cache_last_z_test"] = last_z_test
-
     st.session_state["cache_cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # artifacts
@@ -1173,7 +1189,6 @@ if run_button:
     if isinstance(last_latent_df, pd.DataFrame):
         artifact_put_df_csv("latent_mean_abs_shap.csv", last_latent_df, note="latent 维度 MeanAbsSHAP")
 
-    # shap figs to artifact (best-effort)
     try:
         if last_shap_z is not None and last_z_test is not None:
             fig1 = plt.figure(figsize=(9.5, 5.5))
@@ -1185,22 +1200,13 @@ if run_button:
             shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
             artifact_put_fig_png("shap_summary_bar.png", fig2, note="SHAP summary bar")
             plt.close(fig2)
-
-        if isinstance(last_latent_df, pd.DataFrame):
-            fig3 = plt.figure(figsize=(8.8, 4.2))
-            top_lat = last_latent_df.head(20)
-            plt.bar(top_lat["LatentDim"].astype(str), top_lat["MeanAbsSHAP"])
-            plt.xticks(rotation=45, ha="right")
-            plt.title("Top 20 latent dims by MeanAbsSHAP")
-            plt.tight_layout()
-            artifact_put_fig_png("latent_top20_bar.png", fig3, note="Top20 latent dims")
-            plt.close(fig3)
     except Exception:
         pass
 
     # clear downstream caches
     for k in [
         "cache_enrich_go_kegg",
+        "cache_enrich_lib_idx",
         "cache_de_df",
         "cache_de_groups",
         "cache_cluster_df",
@@ -1209,8 +1215,11 @@ if run_button:
     ]:
         st.session_state.pop(k, None)
 
-    st.success("✅ 主流程运行完成：结果已缓存（切换 Tabs / 下载不会丢失）。")
+    # default page
+    st.session_state["page"] = "主流程"
+    st.success("✅ 主流程运行完成：结果已缓存。")
     st.rerun()
+
 
 # =====================================================
 # KPI cards
@@ -1245,378 +1254,449 @@ if "cache_metrics_df" in st.session_state:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.divider()
 
 # =====================================================
-# Tabs ONLY
+# Button Navigation (replaces Tabs)
 # =====================================================
-tabs = st.tabs(["① 主流程", "② 下载中心", "③ GO/KEGG", "④ 差异分析", "⑤ 聚类&生存"])
+PAGES = ["主流程", "下载中心", "功能富集", "差异分析", "聚类&生存"]
+PAGE_TO_ANCHOR = {
+    "主流程": "main",
+    "下载中心": "download",
+    "功能富集": "enrich",
+    "差异分析": "de",
+    "聚类&生存": "survival",
+}
+if "page" not in st.session_state:
+    st.session_state["page"] = "主流程"
+
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown("### 模块导航（按钮）")
+cols = st.columns([1, 1, 1, 1, 1])
+for i, p in enumerate(PAGES):
+    with cols[i]:
+        is_active = (st.session_state["page"] == p)
+        label = f"✅ {p}" if is_active else p
+        if st.button(label, use_container_width=True, key=f"nav_{p}"):
+            st.session_state["page"] = p
+            st.rerun()
+st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _need_run():
     st.info("请先运行主流程（点击上方 🚀 运行主流程）。")
 
 
-# ---------------- Tab ① 主流程 ----------------
-with tabs[0]:
+# =====================================================
+# Render pages
+# =====================================================
+def render_main():
     st.markdown('<div id="main"></div>', unsafe_allow_html=True)
     st.subheader("① 主流程（性能 / 稳定性 / SHAP）")
-
     if "cache_stability_df" not in st.session_state:
         _need_run()
-    else:
-        metrics_df = st.session_state["cache_metrics_df"]
-        summary_df = st.session_state["cache_summary_df"]
-        stability_df = st.session_state["cache_stability_df"]
-        latent_df = st.session_state.get("cache_latent_df", None)
-        top20 = st.session_state["cache_top20_genes"]
+        return
 
+    metrics_df = st.session_state["cache_metrics_df"]
+    summary_df = st.session_state["cache_summary_df"]
+    stability_df = st.session_state["cache_stability_df"]
+    top20 = st.session_state["cache_top20_genes"]
+    last_shap_z = st.session_state.get("cache_last_shap_z", None)
+    last_z_test = st.session_state.get("cache_last_z_test", None)
+    latent_df = st.session_state.get("cache_latent_df", None)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 📊 模型性能（每次 run）")
+    st.dataframe(metrics_df, use_container_width=True, height=260)
+    st.markdown("#### 📊 指标汇总（均值±标准差）")
+    st.dataframe(summary_df, use_container_width=True, height=210)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 🧬 Top20 候选生物标志物（MeanImportance）")
+    st.code("\n".join(top20))
+    st.markdown("#### 📌 稳定性（Frequency / CV）Top50")
+    st.dataframe(stability_df.head(50), use_container_width=True, height=420)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if last_shap_z is not None and last_z_test is not None:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 📊 模型性能（每次 run）")
-        st.dataframe(metrics_df, use_container_width=True, height=260)
-        st.markdown("#### 📊 指标汇总（均值±标准差）")
-        st.dataframe(summary_df, use_container_width=True, height=210)
+        st.markdown("#### 🔍 Latent SHAP Summary（dot / bar）")
+        fig1 = plt.figure(figsize=(9.5, 5.5))
+        shap.summary_plot(last_shap_z, features=last_z_test, show=False)
+        st.pyplot(fig1)
+        plt.close(fig1)
+
+        fig2 = plt.figure(figsize=(9.5, 5.0))
+        shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
+        st.pyplot(fig2)
+        plt.close(fig2)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    if isinstance(latent_df, pd.DataFrame):
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 🧬 Top20 候选生物标志物（MeanImportance）")
-        st.code("\n".join(top20))
-        st.markdown("#### 📌 稳定性（Frequency / CV）Top50")
-        st.dataframe(stability_df.head(50), use_container_width=True, height=420)
+        st.markdown("#### 📈 Top latent 维度（MeanAbsSHAP）")
+        st.dataframe(latent_df.head(20), use_container_width=True, height=360)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        last_shap_z = st.session_state.get("cache_last_shap_z", None)
-        last_z_test = st.session_state.get("cache_last_z_test", None)
 
-        if last_shap_z is not None and last_z_test is not None:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 🔍 Latent SHAP Summary（dot / bar）")
-            fig1 = plt.figure(figsize=(9.5, 5.5))
-            shap.summary_plot(last_shap_z, features=last_z_test, show=False)
-            st.pyplot(fig1)
-            plt.close(fig1)
-
-            fig2 = plt.figure(figsize=(9.5, 5.0))
-            shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
-            st.pyplot(fig2)
-            plt.close(fig2)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        if isinstance(latent_df, pd.DataFrame):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 📈 Top20 latent 维度（MeanAbsSHAP）")
-            st.dataframe(latent_df.head(20), use_container_width=True, height=360)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------- Tab ② 下载中心 ----------------
-with tabs[1]:
+def render_download():
     st.markdown('<div id="download"></div>', unsafe_allow_html=True)
     st.subheader("② 下载中心（文件列表 / 单文件 / ZIP + REPORT）")
-
     if "cache_stability_df" not in st.session_state:
         _need_run()
+        return
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 📦 结果文件列表（当前 session）")
+    st.dataframe(artifact_table_df(), use_container_width=True, height=320)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### ⬇ 单文件下载")
+    cols = st.columns(3)
+    artifacts = st.session_state.get("cache_artifacts", {})
+    if artifacts:
+        names = list(artifacts.keys())
+        for i, name in enumerate(names):
+            meta = artifacts[name]
+            with cols[i % 3]:
+                st.download_button(f"⬇ {name}", meta["bytes"], name, mime=meta["mime"])
     else:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 📦 结果文件列表（当前 session）")
-        table = artifact_table_df()
-        st.dataframe(table, use_container_width=True, height=320)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.info("当前没有可下载文件。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### ⬇ 单文件下载")
-        cols = st.columns(3)
-        artifacts = st.session_state.get("cache_artifacts", {})
-        if artifacts:
-            names = list(artifacts.keys())
-            for i, name in enumerate(names):
-                meta = artifacts[name]
-                with cols[i % 3]:
-                    st.download_button(
-                        label=f"⬇ {name}",
-                        data=meta["bytes"],
-                        file_name=name,
-                        mime=meta["mime"],
-                    )
-        else:
-            st.info("当前没有可下载文件。")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 🧾 ZIP 打包（含 REPORT.md）")
+    ts = now_stamp()
+    zip_name = f"results_{ts}.zip"
+    zip_bytes = build_results_zip(ts)
+    st.download_button("⬇ 下载 ZIP（results_*.zip）", zip_bytes, zip_name, mime="application/zip")
+    with st.expander("预览 REPORT.md（会包含在 ZIP）"):
+        st.markdown(build_report_md())
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 🧾 ZIP 打包（含 REPORT.md）")
-        ts = now_stamp()
-        zip_name = f"results_{ts}.zip"
-        zip_bytes = build_results_zip(ts)
-        st.download_button("⬇ 下载 ZIP（results_*.zip）", zip_bytes, zip_name, mime="application/zip")
-        with st.expander("预览 REPORT.md（会包含在 ZIP）", expanded=False):
-            st.markdown(build_report_md())
-        st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Tab ③ GO/KEGG ----------------
-with tabs[2]:
+def render_enrich():
     st.markdown('<div id="enrich"></div>', unsafe_allow_html=True)
-    st.subheader("③ GO / KEGG 富集分析（Top20）")
-
+    st.subheader("③ GO / KEGG 富集分析（Top20，按钮切换 + 气泡图）")
     if "cache_top20_genes" not in st.session_state:
         _need_run()
-    else:
-        top_genes = st.session_state["cache_top20_genes"]
+        return
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 输入基因（Top20）")
-        st.code("\n".join(top_genes))
-        org = st.selectbox("物种（Enrichr organism）", ["Human", "Mouse"], index=0)
-        st.markdown('<div class="smallMuted">依赖：gseapy + 网络访问 Enrichr</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    top_genes = st.session_state["cache_top20_genes"]
 
-        if not GSEAPY_OK:
-            st.warning("未安装 gseapy，无法做 GO/KEGG：pip install gseapy")
-        else:
-            if st.button("🧪 运行 GO/KEGG（Enrichr）", type="primary"):
-                with st.spinner("富集分析运行中（需要联网访问 Enrichr）..."):
-                    try:
-                        res_dict = run_enrichr(top_genes, organism=org)
-                        st.session_state["cache_enrich_go_kegg"] = res_dict
-                        for lib, df in res_dict.items():
-                            artifact_put_df_csv(f"enrichr_{lib}.csv", df, note=f"Enrichr: {lib}")
-                        st.success("富集完成 ✅")
-                    except Exception as e:
-                        st.error(f"富集失败：{e}")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 输入基因（Top20）")
+    st.code("\n".join(top_genes))
+    org = st.selectbox("物种（Enrichr organism）", ["Human", "Mouse"], index=0)
+    top_n = st.slider("展示条目数（Top N）", 5, 50, 20, 5)
+    st.markdown('<div class="smallMuted">依赖：gseapy + 网络访问 Enrichr。</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            if "cache_enrich_go_kegg" in st.session_state:
-                res_dict = st.session_state["cache_enrich_go_kegg"]
+    if not GSEAPY_OK:
+        st.warning("未安装 gseapy，无法做 GO/KEGG：pip install gseapy")
+        return
+
+    if st.button("🧪 运行 GO/KEGG（Enrichr）", type="primary"):
+        with st.spinner("富集分析运行中（需要联网访问 Enrichr）..."):
+            try:
+                res_dict = run_enrichr(top_genes, organism=org)
+                st.session_state["cache_enrich_go_kegg"] = res_dict
+                st.session_state["cache_enrich_lib_idx"] = 0
                 for lib, df in res_dict.items():
-                    st.markdown('<div class="card">', unsafe_allow_html=True)
-                    st.markdown(f"#### {lib}")
-                    st.dataframe(df.head(20), use_container_width=True, height=360)
-                    st.download_button(
-                        f"⬇ 下载 {lib}",
-                        df.to_csv(index=False).encode("utf-8"),
-                        f"enrichr_{lib}.csv",
-                        mime="text/csv",
-                    )
-                    st.markdown("</div>", unsafe_allow_html=True)
+                    artifact_put_df_csv(f"enrichr_{lib}.csv", df, note=f"Enrichr: {lib}")
+                st.success("富集完成 ✅")
+            except Exception as e:
+                st.error(f"富集失败：{e}")
+                return
 
-# ---------------- Tab ④ 差异分析（含箱线图） ----------------
-with tabs[3]:
+    if "cache_enrich_go_kegg" not in st.session_state:
+        st.info("点击上面的「运行 GO/KEGG」生成结果。")
+        return
+
+    res_dict = st.session_state["cache_enrich_go_kegg"]
+    libs = list(res_dict.keys())
+    if "cache_enrich_lib_idx" not in st.session_state:
+        st.session_state["cache_enrich_lib_idx"] = 0
+
+    idx = int(st.session_state["cache_enrich_lib_idx"])
+    idx = max(0, min(idx, len(libs) - 1))
+    st.session_state["cache_enrich_lib_idx"] = idx
+
+    # Prev / Next
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        if st.button("⬅ 上一个结果", use_container_width=True, disabled=(idx == 0)):
+            st.session_state["cache_enrich_lib_idx"] = idx - 1
+            st.rerun()
+    with c2:
+        st.markdown(f"#### 当前结果：**{libs[idx]}**  （{idx+1}/{len(libs)}）")
+    with c3:
+        if st.button("下一个结果 ➡", use_container_width=True, disabled=(idx == len(libs) - 1)):
+            st.session_state["cache_enrich_lib_idx"] = idx + 1
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    lib = libs[idx]
+    df = res_dict[lib].copy()
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 📊 富集结果表（Top）")
+    adjp_col = _pick_col(df, ["Adjusted P-value", "Adjusted P-value "])
+    p_col = _pick_col(df, ["P-value", "p_value", "p-value"])
+    if adjp_col is not None:
+        df_show = df.sort_values(adjp_col, ascending=True).head(int(top_n))
+    elif p_col is not None:
+        df_show = df.sort_values(p_col, ascending=True).head(int(top_n))
+    else:
+        df_show = df.head(int(top_n))
+    st.dataframe(df_show, use_container_width=True, height=360)
+
+    st.markdown("#### 🫧 气泡图（Top）")
+    try:
+        figb = plot_enrich_bubble(df, title=f"Enrichr Bubble: {lib}", top_n=int(top_n))
+        st.pyplot(figb)
+        artifact_put_fig_png(f"enrich_bubble_{lib}.png", figb, note=f"Bubble plot: {lib}")
+        plt.close(figb)
+    except Exception as e:
+        st.error(f"气泡图绘制失败：{e}")
+
+    st.download_button(f"⬇ 下载 {lib} CSV", df.to_csv(index=False).encode("utf-8"), f"enrichr_{lib}.csv", mime="text/csv")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_de():
     st.markdown('<div id="de"></div>', unsafe_allow_html=True)
-    st.subheader("④ 差异分析（labels 两组，Top20）")
-
+    st.subheader("④ 差异分析（Top20 + 火山图 + 箱线图）")
     if "cache_rna" not in st.session_state or "cache_labels" not in st.session_state:
         _need_run()
-    else:
-        rna = st.session_state["cache_rna"]
-        labels = st.session_state["cache_labels"]
-        top_genes = st.session_state["cache_top20_genes"]
+        return
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 依赖检查")
-        st.write({"scipy": SCIPY_OK, "statsmodels": STATSMODELS_OK})
-        st.markdown("</div>", unsafe_allow_html=True)
+    rna = st.session_state["cache_rna"]
+    labels = st.session_state["cache_labels"]
+    top_genes = st.session_state["cache_top20_genes"]
 
-        if not (SCIPY_OK and STATSMODELS_OK):
-            st.warning("差异分析需要：pip install scipy statsmodels")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 运行与结果")
-            if st.button("🧬 运行 Top20 差异分析（t-test + FDR）", type="primary"):
-                with st.spinner("差异分析计算中..."):
-                    try:
-                        de_df, groups = compute_de_top_genes(rna, labels, top_genes)
-                        st.session_state["cache_de_df"] = de_df
-                        st.session_state["cache_de_groups"] = groups
-                        artifact_put_df_csv("top20_differential_expression.csv", de_df, note="Top20 DE (t-test+FDR)")
-                        st.success("差异分析完成 ✅")
-                    except Exception as e:
-                        st.error(f"差异分析失败：{e}")
-            st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 依赖检查")
+    st.write({"scipy": SCIPY_OK, "statsmodels": STATSMODELS_OK})
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if "cache_de_df" in st.session_state:
-            de_df = st.session_state["cache_de_df"]
+    if not (SCIPY_OK and STATSMODELS_OK):
+        st.warning("差异分析需要：pip install scipy statsmodels")
+        return
 
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 差异结果（Top20）")
-            st.dataframe(de_df, use_container_width=True, height=360)
-            st.download_button(
-                "⬇ 下载差异结果",
-                de_df.to_csv(index=False).encode("utf-8"),
-                "top20_differential_expression.csv",
-                mime="text/csv",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 火山图（Top20）")
-            figv = plt.figure(figsize=(7.8, 4.6))
-            x = de_df["log2FC"].values
-            yv = -np.log10(de_df["p_value"].values + 1e-300)
-            plt.scatter(x, yv)
-            for _, row in de_df.iterrows():
-                plt.text(row["log2FC"], -np.log10(row["p_value"] + 1e-300), row["Gene"], fontsize=8)
-            plt.xlabel("log2FC")
-            plt.ylabel("-log10(p)")
-            plt.title("Volcano (Top20)")
-            plt.tight_layout()
-            st.pyplot(figv)
-            artifact_put_fig_png("de_volcano_top20.png", figv, note="Volcano plot (Top20)")
-            plt.close(figv)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # ===== 箱线图模块（无论是否跑 DE 都可画）=====
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 📦 Top 基因表达箱线图（按 Label 分组）")
-        default_sel = top_genes[:6]  # 默认 6 个更清晰
-        sel_genes = st.multiselect(
-            "选择要画的基因（建议 3~10 个更清晰）",
-            options=top_genes,
-            default=default_sel,
-        )
-        save_png = st.checkbox("把箱线图加入下载中心（PNG）", value=True)
-
-        if st.button("📈 生成箱线图", type="primary"):
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 运行与结果")
+    if st.button("🧬 运行 Top20 差异分析（t-test + FDR）", type="primary"):
+        with st.spinner("差异分析计算中..."):
             try:
-                fig_box = plot_gene_boxplots(rna, labels, sel_genes)
-                st.pyplot(fig_box)
-                if save_png:
-                    artifact_put_fig_png("top_genes_boxplots.png", fig_box, note="Boxplots by Label (selected genes)")
-                plt.close(fig_box)
+                de_df, groups = compute_de_top_genes(rna, labels, top_genes)
+                st.session_state["cache_de_df"] = de_df
+                st.session_state["cache_de_groups"] = groups
+                artifact_put_df_csv("top20_differential_expression.csv", de_df, note="Top20 DE (t-test+FDR)")
+                st.success("差异分析完成 ✅")
             except Exception as e:
-                st.error(f"箱线图生成失败：{e}")
+                st.error(f"差异分析失败：{e}")
+    st.markdown("</div>", unsafe_allow_html=True)
 
+    if "cache_de_df" in st.session_state:
+        de_df = st.session_state["cache_de_df"]
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### 差异结果（Top20）")
+        st.dataframe(de_df, use_container_width=True, height=360)
+        st.download_button("⬇ 下载差异结果", de_df.to_csv(index=False).encode("utf-8"),
+                           "top20_differential_expression.csv", mime="text/csv")
         st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Tab ⑤ 聚类 & 生存 ----------------
-with tabs[4]:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### 火山图（Top20）")
+        figv = plt.figure(figsize=(7.8, 4.6))
+        x = de_df["log2FC"].values
+        yv = -np.log10(de_df["p_value"].values + 1e-300)
+        plt.scatter(x, yv)
+        for _, row in de_df.iterrows():
+            plt.text(row["log2FC"], -np.log10(row["p_value"] + 1e-300), row["Gene"], fontsize=8)
+        plt.xlabel("log2FC")
+        plt.ylabel("-log10(p)")
+        plt.title("Volcano (Top20)")
+        plt.tight_layout()
+        st.pyplot(figv)
+        artifact_put_fig_png("de_volcano_top20.png", figv, note="Volcano plot (Top20)")
+        plt.close(figv)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 📦 Top 基因表达箱线图（按 Label 分组）")
+    default_sel = top_genes[:6]
+    sel_genes = st.multiselect("选择要画的基因（建议 3~10 个更清晰）", options=top_genes, default=default_sel)
+    save_png = st.checkbox("把箱线图加入下载中心（PNG）", value=True)
+    if st.button("📈 生成箱线图", type="primary"):
+        try:
+            fig_box = plot_gene_boxplots(rna, labels, sel_genes)
+            st.pyplot(fig_box)
+            if save_png:
+                artifact_put_fig_png("top_genes_boxplots.png", fig_box, note="Boxplots by Label (selected genes)")
+            plt.close(fig_box)
+        except Exception as e:
+            st.error(f"箱线图生成失败：{e}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_survival():
     st.markdown('<div id="survival"></div>', unsafe_allow_html=True)
     st.subheader("⑤ 聚类（Top20）+ 生存（KM/Cox）")
-
     if "cache_rna" not in st.session_state or "cache_top20_genes" not in st.session_state:
         _need_run()
-    else:
-        rna = st.session_state["cache_rna"]
-        top_genes = st.session_state["cache_top20_genes"]
+        return
 
+    rna = st.session_state["cache_rna"]
+    top_genes = st.session_state["cache_top20_genes"]
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 聚类输入（Top20）")
+    st.code("\n".join(top_genes))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    if st.button("🧩 运行聚类（Top20 基因表达）", type="primary"):
+        with st.spinner("聚类中..."):
+            try:
+                cluster_df, X_scaled_df = cluster_samples_by_top_genes(
+                    rna=rna, top_genes=top_genes, n_clusters=int(cluster_k), seed=int(seed_base)
+                )
+                st.session_state["cache_cluster_df"] = cluster_df
+                st.session_state["cache_cluster_X_scaled"] = X_scaled_df
+                artifact_put_df_csv("top20_cluster_labels.csv", cluster_df, note="KMeans clusters by Top20")
+                st.success("聚类完成 ✅")
+            except Exception as e:
+                st.error(f"聚类失败：{e}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if "cache_cluster_df" not in st.session_state:
+        st.info("先点击「运行聚类」生成 Cluster 标签，然后再做生存分析。")
+        return
+
+    cluster_df = st.session_state["cache_cluster_df"]
+    X_scaled_df = st.session_state.get("cache_cluster_X_scaled", None)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 聚类结果（Sample → Cluster）")
+    st.dataframe(cluster_df.head(100), use_container_width=True, height=340)
+    st.download_button("⬇ 下载聚类结果", cluster_df.to_csv(index=False).encode("utf-8"),
+                       "top20_cluster_labels.csv", mime="text/csv")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if X_scaled_df is not None:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 聚类输入（Top20）")
-        st.code("\n".join(top_genes))
+        st.markdown("#### 热图（z-score，按 Cluster 排序）")
+        df_plot = X_scaled_df.copy()
+        df_plot["Cluster"] = cluster_df.set_index("Sample").loc[df_plot.index]["Cluster"].values
+        df_plot = df_plot.sort_values("Cluster")
+        mat = df_plot.drop(columns=["Cluster"]).values
+
+        fig_h = plt.figure(figsize=(10.0, 5.0))
+        plt.imshow(mat, aspect="auto")
+        plt.colorbar(label="z-score")
+        plt.yticks([])
+        plt.xticks(range(df_plot.shape[1] - 1), df_plot.drop(columns=["Cluster"]).columns, rotation=90, fontsize=7)
+        plt.title("Top20 genes (z-score) sorted by Cluster")
+        plt.tight_layout()
+        st.pyplot(fig_h)
+        artifact_put_fig_png("cluster_heatmap_top20.png", fig_h, note="Heatmap by cluster")
+        plt.close(fig_h)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        if st.button("🧩 运行聚类（Top20 基因表达）", type="primary"):
-            with st.spinner("聚类中..."):
-                try:
-                    cluster_df, X_scaled_df = cluster_samples_by_top_genes(
-                        rna=rna, top_genes=top_genes, n_clusters=int(cluster_k), seed=int(seed_base)
-                    )
-                    st.session_state["cache_cluster_df"] = cluster_df
-                    st.session_state["cache_cluster_X_scaled"] = X_scaled_df
-                    artifact_put_df_csv("top20_cluster_labels.csv", cluster_df, note="KMeans clusters by Top20")
-                    st.success("聚类完成 ✅")
-                except Exception as e:
-                    st.error(f"聚类失败：{e}")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("#### 生存分析（按 Cluster 分组）")
+
+    if not LIFELINES_OK:
+        st.warning("未安装 lifelines：pip install lifelines")
         st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-        if "cache_cluster_df" in st.session_state:
-            cluster_df = st.session_state["cache_cluster_df"]
-            X_scaled_df = st.session_state.get("cache_cluster_X_scaled", None)
+    surv_df_source = read_csv_cached(surv_file) if surv_file is not None else st.session_state.get("cache_demo_surv_raw", None)
+    if surv_df_source is None:
+        st.info("未提供生存数据（上传或示例 sur.csv），跳过 KM/Cox。")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 聚类结果（Sample → Cluster）")
-            st.dataframe(cluster_df.head(100), use_container_width=True, height=340)
-            st.download_button(
-                "⬇ 下载聚类结果",
-                cluster_df.to_csv(index=False).encode("utf-8"),
-                "top20_cluster_labels.csv",
-                mime="text/csv",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+    surv = clean_columns(surv_df_source.copy())
+    if "Sample" not in surv.columns:
+        surv_cols = {_norm(c): c for c in surv.columns}
+        for a in ["sample", "sampleid", "id", "subject", "patient"]:
+            if _norm(a) in surv_cols:
+                surv = surv.rename(columns={surv_cols[_norm(a)]: "Sample"})
+                break
 
-            if X_scaled_df is not None:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown("#### 热图（z-score，按 Cluster 排序）")
-                df_plot = X_scaled_df.copy()
-                df_plot["Cluster"] = cluster_df.set_index("Sample").loc[df_plot.index]["Cluster"].values
-                df_plot = df_plot.sort_values("Cluster")
-                mat = df_plot.drop(columns=["Cluster"]).values
+    if "Sample" not in surv.columns or "Time" not in surv.columns or "Event" not in surv.columns:
+        st.error("生存数据必须包含列：Sample, Time, Event")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-                fig_h = plt.figure(figsize=(10.0, 5.0))
-                plt.imshow(mat, aspect="auto")
-                plt.colorbar(label="z-score")
-                plt.yticks([])
-                plt.xticks(range(df_plot.shape[1] - 1), df_plot.drop(columns=["Cluster"]).columns, rotation=90, fontsize=7)
-                plt.title("Top20 genes (z-score) sorted by Cluster")
-                plt.tight_layout()
-                st.pyplot(fig_h)
-                artifact_put_fig_png("cluster_heatmap_top20.png", fig_h, note="Heatmap by cluster")
-                plt.close(fig_h)
-                st.markdown("</div>", unsafe_allow_html=True)
+    surv["Sample"] = surv["Sample"].astype(str).str.strip()
+    surv = surv.set_index("Sample")
 
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("#### 生存分析（按 Cluster 分组）")
-            if not LIFELINES_OK:
-                st.warning("未安装 lifelines：pip install lifelines")
-            else:
-                surv_df_source = read_csv_cached(surv_file) if surv_file is not None else st.session_state.get("cache_demo_surv_raw", None)
-                if surv_df_source is None:
-                    st.info("未提供生存数据（上传或示例 sur.csv），跳过 KM/Cox。")
-                else:
-                    surv = clean_columns(surv_df_source.copy())
-                    if "Sample" not in surv.columns:
-                        surv_cols = {_norm(c): c for c in surv.columns}
-                        for a in ["sample", "sampleid", "id", "subject", "patient"]:
-                            if _norm(a) in surv_cols:
-                                surv = surv.rename(columns={surv_cols[_norm(a)]: "Sample"})
-                                break
+    cl = cluster_df.copy()
+    cl["Sample"] = cl["Sample"].astype(str).str.strip()
+    cl = cl.set_index("Sample")
 
-                    if "Sample" not in surv.columns or "Time" not in surv.columns or "Event" not in surv.columns:
-                        st.error("生存数据必须包含列：Sample, Time, Event")
-                    else:
-                        surv["Sample"] = surv["Sample"].astype(str).str.strip()
-                        surv = surv.set_index("Sample")
+    common = sorted(list(set(cl.index).intersection(set(surv.index))))
+    if len(common) < 10:
+        st.error("生存数据与聚类样本交集太少（<10），无法生存分析。")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-                        cl = cluster_df.copy()
-                        cl["Sample"] = cl["Sample"].astype(str).str.strip()
-                        cl = cl.set_index("Sample")
+    surv_aligned = surv.loc[common].copy()
+    surv_aligned["Cluster"] = cl.loc[common]["Cluster"].astype(int).values
+    surv_aligned["Time"] = pd.to_numeric(surv_aligned["Time"], errors="coerce")
+    surv_aligned["Event"] = pd.to_numeric(surv_aligned["Event"], errors="coerce")
+    surv_aligned = surv_aligned.dropna(subset=["Time", "Event", "Cluster"])
 
-                        common = sorted(list(set(cl.index).intersection(set(surv.index))))
-                        if len(common) < 10:
-                            st.error("生存数据与聚类样本交集太少（<10），无法生存分析。")
-                        else:
-                            surv_aligned = surv.loc[common].copy()
-                            surv_aligned["Cluster"] = cl.loc[common]["Cluster"].astype(int).values
-                            surv_aligned["Time"] = pd.to_numeric(surv_aligned["Time"], errors="coerce")
-                            surv_aligned["Event"] = pd.to_numeric(surv_aligned["Event"], errors="coerce")
-                            surv_aligned = surv_aligned.dropna(subset=["Time", "Event", "Cluster"])
+    fig_km, p_lr = km_plot_by_group(surv_aligned, group_col="Cluster")
+    st.pyplot(fig_km)
+    artifact_put_fig_png("survival_km_by_cluster.png", fig_km, note="KM curves by cluster")
+    plt.close(fig_km)
+    if p_lr is not None:
+        st.write({"Log-rank p-value (2 groups)": p_lr})
 
-                            fig_km, p_lr = km_plot_by_group(surv_aligned, group_col="Cluster")
-                            st.pyplot(fig_km)
-                            artifact_put_fig_png("survival_km_by_cluster.png", fig_km, note="KM curves by cluster")
-                            plt.close(fig_km)
-                            if p_lr is not None:
-                                st.write({"Log-rank p-value (2 groups)": p_lr})
+    st.markdown("##### Cox（Cluster 作为协变量）")
+    df_cox = surv_aligned[["Time", "Event", "Cluster"]].copy().reset_index(drop=True)
+    df_cox = pd.get_dummies(df_cox, columns=["Cluster"], drop_first=True)
 
-                            st.markdown("##### Cox（Cluster 作为协变量）")
-                            df_cox = surv_aligned[["Time", "Event", "Cluster"]].copy().reset_index(drop=True)
-                            df_cox = pd.get_dummies(df_cox, columns=["Cluster"], drop_first=True)
+    df_train, df_test = train_test_split(df_cox, test_size=float(test_size), random_state=int(seed_base))
+    cph = CoxPHFitter(penalizer=float(cox_penalizer))
+    cph.fit(df_train, duration_col="Time", event_col="Event")
 
-                            df_train, df_test = train_test_split(df_cox, test_size=float(test_size), random_state=int(seed_base))
-                            cph = CoxPHFitter(penalizer=float(cox_penalizer))
-                            cph.fit(df_train, duration_col="Time", event_col="Event")
+    risk = cph.predict_partial_hazard(df_test)
+    c_index = concordance_index(df_test["Time"], -risk.values, df_test["Event"])
+    st.write({"C-index": float(c_index)})
 
-                            risk = cph.predict_partial_hazard(df_test)
-                            c_index = concordance_index(df_test["Time"], -risk.values, df_test["Event"])
-                            st.write({"C-index": float(c_index)})
+    cox_sum = cph.summary.reset_index()
+    st.session_state["cache_cox_cluster_summary"] = cox_sum
+    artifact_put_df_csv("cox_cluster_summary.csv", cox_sum, note="Cox summary (Cluster)")
+    st.dataframe(cox_sum, use_container_width=True, height=360)
+    st.download_button("⬇ 下载 Cox summary（Cluster）",
+                       cox_sum.to_csv(index=False).encode("utf-8"),
+                       "cox_cluster_summary.csv", mime="text/csv")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-                            cox_sum = cph.summary.reset_index()
-                            st.session_state["cache_cox_cluster_summary"] = cox_sum
-                            artifact_put_df_csv("cox_cluster_summary.csv", cox_sum, note="Cox summary (Cluster)")
-                            st.dataframe(cox_sum, use_container_width=True, height=360)
-                            st.download_button(
-                                "⬇ 下载 Cox summary（Cluster）",
-                                cox_sum.to_csv(index=False).encode("utf-8"),
-                                "cox_cluster_summary.csv",
-                                mime="text/csv",
-                            )
-            st.markdown("</div>", unsafe_allow_html=True)
+
+# =====================================================
+# Dispatch
+# =====================================================
+page = st.session_state.get("page", "主流程")
+if page == "主流程":
+    render_main()
+elif page == "下载中心":
+    render_download()
+elif page == "功能富集":
+    render_enrich()
+elif page == "差异分析":
+    render_de()
+elif page == "聚类&生存":
+    render_survival()
 
 st.divider()
 st.caption(
