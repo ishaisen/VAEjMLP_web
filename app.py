@@ -341,7 +341,7 @@ def plot_gene_boxplots(rna: pd.DataFrame, labels: pd.DataFrame, genes: list, gro
 
 
 # ---------------- Enrich ----------------
-def run_enrichr(top_genes: list, organism: str = "Human"):
+def run_enrichr(top_genes: list, organism: str = "human"):
     if not GSEAPY_OK:
         raise RuntimeError("缺少 gseapy，无法做 GO/KEGG。请安装：pip install gseapy")
 
@@ -1746,3 +1746,4 @@ st.caption(
     "GO/KEGG（Enrichr）需 gseapy 且需要网络；"
     "生存分析需 lifelines。"
 )
+
