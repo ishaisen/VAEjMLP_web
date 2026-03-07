@@ -1430,7 +1430,15 @@ def render_enrich():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("#### 输入基因（Top20）")
     st.code("\n".join(top_genes))
-    org = st.selectbox("物种（Enrichr organism）", ["Human", "Mouse"], index=0)
+    org = st.selectbox("物种", ["Human", "Mouse"], index=0)
+org_map = {
+    "Human": "human",
+    "Mouse": "mouse"
+}
+
+organism = org_map[org]
+
+res_dict = run_enrichr(top_genes, organism=organism)
     top_n = st.slider("展示条目数（Top N）", 5, 50, 20, 5)
     st.markdown('<div class="smallMuted">依赖：gseapy + 网络访问 Enrichr。</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1746,4 +1754,5 @@ st.caption(
     "GO/KEGG（Enrichr）需 gseapy 且需要网络；"
     "生存分析需 lifelines。"
 )
+
 
