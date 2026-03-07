@@ -7,13 +7,13 @@
 #   - Demo gate（未开启时仅显示开关）
 #   - Hero: Input / Workflow / Output
 #   - 顶部 Sticky Toolbar（锚点跳转+回到顶部+模块高亮）
-#   - 侧边导航：科研数据分析平台风格（分组折叠 + 高亮选中）
+#   - 模块导航：按钮（替代 Tabs）
 #   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md（不依赖 tabulate）
 #   - 清除缓存：一键清空运行结果与下载缓存
 #
 # CHANGE:
-#   - 将“中间模块按钮导航”改为“侧边栏导航（截图风格）”
-#   - 其余功能与页面内容保持不变
+#   - 选中模块按钮（“Tabs”替代按钮）颜色更明显
+#   - 不使用对号 ✅（选中态不显示任何对号/标记）
 # =====================================================
 
 import os
@@ -441,8 +441,7 @@ def cluster_samples_by_top_genes(rna: pd.DataFrame, top_genes: list, n_clusters:
     X = rna.loc[genes_exist].T.astype(float)  # samples x genes
     X_scaled = StandardScaler().fit_transform(X.values)
 
-    # 兼容旧版本 sklearn：避免 n_init="auto"
-    km = KMeans(n_clusters=int(n_clusters), random_state=int(seed), n_init=10)
+    km = KMeans(n_clusters=int(n_clusters), random_state=int(seed), n_init="auto")
     clusters = km.fit_predict(X_scaled)
 
     cluster_df = pd.DataFrame({"Sample": X.index.astype(str), "Cluster": clusters.astype(int)})
@@ -811,67 +810,30 @@ st.markdown(
       .smallMuted { opacity: 0.70; font-size: 0.90rem; }
       .stDataFrame { border-radius: 12px; overflow: hidden; }
 
-      /* ===== Sidebar: screenshot-like scientific platform style ===== */
-      [data-testid="stSidebar"] {
-        background: #334155;
-        border-right: 1px solid rgba(255,255,255,0.10);
-      }
-      [data-testid="stSidebar"] * {
-        color: rgba(255,255,255,0.92);
-      }
-      [data-testid="stSidebar"] .stMarkdown h1,
-      [data-testid="stSidebar"] .stMarkdown h2,
-      [data-testid="stSidebar"] .stMarkdown h3 {
-        color: rgba(255,255,255,0.95);
-      }
-      .sbTitle {
-        font-weight: 900;
-        font-size: 18px;
-        letter-spacing: -0.02em;
-        padding: 12px 8px 10px 8px;
-        margin-bottom: 8px;
-        border-bottom: 1px solid rgba(255,255,255,0.10);
-      }
-
-      /* nav button style (only those we tag with JS as navbtn) */
-      div[data-testid="stSidebar"] div[data-testid="stButton"] > button.navbtn {
-        width: 100%;
-        text-align: left !important;
-        justify-content: flex-start !important;
-        gap: 10px !important;
-
-        border: 1px solid transparent !important;
-        background: rgba(255,255,255,0.06) !important;
-        color: rgba(255,255,255,0.92) !important;
-
-        border-radius: 12px !important;
-        padding: 10px 12px !important;
+      /* ---- module buttons: make active state obvious; no checkmark used ---- */
+      .modbtn-row { display:flex; gap:10px; flex-wrap: wrap; margin: 8px 0 12px 0; }
+      /* Streamlit button styling hook (best-effort) */
+      div[data-testid="stButton"] > button.modbtn {
+        border: 1px solid rgba(15,23,42,0.14) !important;
+        background: rgba(255,255,255,0.72) !important;
+        color: #0F172A !important;
+        border-radius: 14px !important;
+        padding: 0.55rem 0.8rem !important;
         font-weight: 800 !important;
-        transition: all .12s ease !important;
+        transition: all .14s ease !important;
       }
-      div[data-testid="stSidebar"] div[data-testid="stButton"] > button.navbtn:hover {
-        background: rgba(255,255,255,0.10) !important;
+      div[data-testid="stButton"] > button.modbtn:hover {
         transform: translateY(-1px) !important;
+        box-shadow: 0 10px 22px rgba(2,6,23,0.06) !important;
+        border-color: rgba(37,99,235,0.35) !important;
+        background: rgba(246,248,252,0.96) !important;
       }
-      div[data-testid="stSidebar"] div[data-testid="stButton"] > button.navbtn.active {
-        background: rgba(59,130,246,0.18) !important;
-        border-color: rgba(59,130,246,0.35) !important;
-        box-shadow: 0 10px 22px rgba(2, 132, 199, 0.18) !important;
-        color: rgba(255,255,255,0.98) !important;
+      div[data-testid="stButton"] > button.modbtn.active {
+        border-color: rgba(37,99,235,0.60) !important;
+        background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(59,130,246,0.14)) !important;
+        box-shadow: 0 12px 26px rgba(37,99,235,0.16) !important;
+        color: #1D4ED8 !important;
       }
-
-      /* expander header in sidebar */
-      div[data-testid="stSidebar"] details summary {
-        background: rgba(255,255,255,0.04) !important;
-        border-radius: 12px !important;
-        padding: 8px 10px !important;
-        border: 1px solid rgba(255,255,255,0.08) !important;
-        font-weight: 900 !important;
-      }
-      div[data-testid="stSidebar"] details summary:hover {
-        background: rgba(255,255,255,0.08) !important;
-      }
-      div[data-testid="stSidebar"] .block-container { padding-top: 12px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -882,60 +844,9 @@ st.caption("Latent 表征学习 → 解释性（SHAP）→ 稳定性评估 → �
 
 
 # =====================================================
-# Sidebar: Navigation + Demo gate + Clear cache + Parameters
+# Sidebar: Demo gate + Clear cache
 # =====================================================
-PAGES = ["主流程", "下载中心", "功能富集", "差异分析", "聚类&生存"]
-if "page" not in st.session_state:
-    st.session_state["page"] = "主流程"
-
-
-def _nav_btn(label: str, page_key: str):
-    """Sidebar nav button with active style (no checkmark)."""
-    is_active = (st.session_state.get("page") == page_key)
-    clicked = st.sidebar.button(label, use_container_width=True, key=f"sb_nav_{page_key}_{label}")
-
-    # tag only our nav buttons in sidebar, avoid affecting other buttons
-    components.html(
-        f"""
-        <script>
-          const root = parent.document.querySelector('[data-testid="stSidebar"]');
-          if (root) {{
-            const btns = root.querySelectorAll('button');
-            btns.forEach(b => {{
-              if (b.innerText.trim() === {repr(label)} ) {{
-                b.classList.add("navbtn");
-                {"b.classList.add('active');" if is_active else "b.classList.remove('active');"}
-              }}
-            }});
-          }}
-        </script>
-        """,
-        height=0,
-    )
-
-    if clicked:
-        st.session_state["page"] = page_key
-        st.rerun()
-
-
 with st.sidebar:
-    st.markdown('<div class="sbTitle">科研数据分析平台</div>', unsafe_allow_html=True)
-
-    # 顶部导航
-    _nav_btn("🏠 首页", "主流程")
-    _nav_btn("🔬 主流程", "主流程")
-
-    with st.expander("📌 下游分析", expanded=True):
-        _nav_btn("🧬 功能富集", "功能富集")
-        _nav_btn("📊 差异分析", "差异分析")
-        _nav_btn("🧩 聚类 & 生存", "聚类&生存")
-
-    with st.expander("📦 结果与导出", expanded=False):
-        _nav_btn("⬇ 下载中心", "下载中心")
-
-    st.divider()
-
-    # Demo gate + cache
     st.header("示例数据")
     use_demo_gate = st.checkbox("使用示例数据（Demo）", value=False)
     st.divider()
@@ -945,7 +856,6 @@ with st.sidebar:
         st.success("已清除运行结果与下载缓存。")
         st.rerun()
     st.caption("说明：清除不会影响页面开关，只会清掉已运行结果与下载文件缓存。")
-
 
 if not use_demo_gate:
     st.markdown(
@@ -966,7 +876,7 @@ if not use_demo_gate:
 
 
 # =====================================================
-# Sidebar: parameters (unchanged)
+# Sidebar: parameters
 # =====================================================
 with st.sidebar:
     st.divider()
@@ -1217,7 +1127,6 @@ if run_button:
             shap_values = explainer.shap_values(z_test_np, nsamples=int(shap_nsamples))
             shap_z = ensure_2d_shap(shap_values, z_test_np)
 
-            # ---- gene importance (保持你原逻辑不变) ----
             W_gene_hidden = vae.fc1.weight.detach().cpu().numpy()
             abs_shap_z = np.mean(np.abs(shap_z), axis=0)
             scale = float(np.sum(abs_shap_z))
@@ -1287,17 +1196,14 @@ if run_button:
         artifact_put_df_csv("latent_mean_abs_shap.csv", last_latent_df, note="latent 维度 MeanAbsSHAP")
 
     try:
-        # SHAP 图导出：用 plt.gcf() 更稳，避免空图
         if last_shap_z is not None and last_z_test is not None:
-            plt.close("all")
+            fig1 = plt.figure(figsize=(9.5, 5.5))
             shap.summary_plot(last_shap_z, features=last_z_test, show=False)
-            fig1 = plt.gcf()
             artifact_put_fig_png("shap_summary_dot.png", fig1, note="SHAP summary dot")
             plt.close(fig1)
 
-            plt.close("all")
+            fig2 = plt.figure(figsize=(9.5, 5.0))
             shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
-            fig2 = plt.gcf()
             artifact_put_fig_png("shap_summary_bar.png", fig2, note="SHAP summary bar")
             plt.close(fig2)
     except Exception:
@@ -1355,6 +1261,69 @@ if "cache_metrics_df" in st.session_state:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# =====================================================
+# Button Navigation (replaces Tabs) — NO CHECKMARK
+# =====================================================
+PAGES = ["主流程", "下载中心", "功能富集", "差异分析", "聚类&生存"]
+if "page" not in st.session_state:
+    st.session_state["page"] = "主流程"
+
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown("### 模块导航（按钮）")
+
+cols = st.columns([1, 1, 1, 1, 1])
+for i, p in enumerate(PAGES):
+    with cols[i]:
+        is_active = (st.session_state["page"] == p)
+
+        # 关键：不加 ✅，仅用颜色区分
+        btn_label = p
+
+        # 用 key 区分；并用 JS 给当前按钮加 class active（CSS 控制明显颜色）
+        clicked = st.button(btn_label, use_container_width=True, key=f"nav_{p}")
+        if clicked:
+            st.session_state["page"] = p
+            st.rerun()
+
+        # 给渲染出来的“最后一个按钮”打标签不太可靠，采用 JS：按文本匹配并给 active 加 class
+        # 这段每次都会跑一遍，确保当前选中态生效
+        if is_active:
+            components.html(
+                f"""
+                <script>
+                  const btns = parent.document.querySelectorAll('button');
+                  btns.forEach(b => {{
+                    if (b.innerText.trim() === "{p}") {{
+                      b.classList.add("modbtn");
+                      b.classList.add("active");
+                    }} else if (b.classList.contains("modbtn")) {{
+                      // 只移除 modbtn 的 active，不影响其他按钮
+                      b.classList.remove("active");
+                    }}
+                  }});
+                </script>
+                """,
+                height=0,
+            )
+        else:
+            # ensure modbtn class exists for consistent style
+            components.html(
+                f"""
+                <script>
+                  const btns = parent.document.querySelectorAll('button');
+                  btns.forEach(b => {{
+                    if (b.innerText.trim() === "{p}") {{
+                      b.classList.add("modbtn");
+                    }}
+                  }});
+                </script>
+                """,
+                height=0,
+            )
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+
 def _need_run():
     st.info("请先运行主流程（点击上方 🚀 运行主流程）。")
 
@@ -1394,15 +1363,13 @@ def render_main():
     if last_shap_z is not None and last_z_test is not None:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("#### 🔍 Latent SHAP Summary（dot / bar）")
-        plt.close("all")
+        fig1 = plt.figure(figsize=(9.5, 5.5))
         shap.summary_plot(last_shap_z, features=last_z_test, show=False)
-        fig1 = plt.gcf()
         st.pyplot(fig1)
         plt.close(fig1)
 
-        plt.close("all")
+        fig2 = plt.figure(figsize=(9.5, 5.0))
         shap.summary_plot(last_shap_z, features=last_z_test, plot_type="bar", show=False)
-        fig2 = plt.gcf()
         st.pyplot(fig2)
         plt.close(fig2)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1465,7 +1432,7 @@ def render_enrich():
     st.code("\n".join(top_genes))
     org = st.selectbox("物种（Enrichr organism）", ["Human", "Mouse"], index=0)
     top_n = st.slider("展示条目数（Top N）", 5, 50, 20, 5)
-    st.markdown('<div class="smallMuted">依赖：gseapy + 网络访问 Enrichr；结果用按钮“上一个/下一个”切换。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="smallMuted">依赖：gseapy + 网络访问 Enrichr。</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     if not GSEAPY_OK:
@@ -1527,7 +1494,7 @@ def render_enrich():
         df_show = df.head(int(top_n))
     st.dataframe(df_show, use_container_width=True, height=360)
 
-    st.markdown("#### 🫧 气泡图（Top）")
+    st.markdown("#### 气泡图（Top）")
     try:
         figb = plot_enrich_bubble(df, title=f"Enrichr Bubble: {lib}", top_n=int(top_n))
         st.pyplot(figb)
