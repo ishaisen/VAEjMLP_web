@@ -3,17 +3,10 @@
 # VAEjMLP latent-SHAP + 稳定性 + SHAP可视化 + GO/KEGG(按钮切换+气泡图)
 # + DE(含箱线图) + 聚类 + 生存
 #
-# UI:
-#   - Demo gate（未开启时仅显示开关）
-#   - Hero: Input / Workflow / Output
-#   - 顶部 Sticky Toolbar（锚点跳转+回到顶部+模块高亮）
-#   - 模块导航：按钮（替代 Tabs）
-#   - 下载中心：文件列表 + 单文件下载 + ZIP + REPORT.md（不依赖 tabulate）
-#   - 清除缓存：一键清空运行结果与下载缓存
-#
-# CHANGE:
-#   - 选中模块按钮（“Tabs”替代按钮）颜色更明显
-#   - 不使用对号 ✅（选中态不显示任何对号/标记）
+# FIX:
+#   - 修复 gseapy enrichr organism 参数：Human/Mouse -> human/mouse
+#   - 增加 organism 规范化函数，兼容更多写法
+#   - KEGG 库选择与 organism 映射保持一致
 # =====================================================
 
 import os
@@ -341,29 +334,80 @@ def plot_gene_boxplots(rna: pd.DataFrame, labels: pd.DataFrame, genes: list, gro
 
 
 # ---------------- Enrich ----------------
+def normalize_enrichr_organism(organism: str) -> str:
+    """
+    将 UI 或用户输入映射为 gseapy.enrichr 可接受的 organism。
+    """
+    if organism is None:
+        return "human"
+
+    s = str(organism).strip().lower()
+
+    mapping = {
+        "human": "human",
+        "homo sapiens": "human",
+        "h.sapiens": "human",
+        "hsapiens": "human",
+        "hs": "human",
+
+        "mouse": "mouse",
+        "mus musculus": "mouse",
+        "m.musculus": "mouse",
+        "mmusculus": "mouse",
+        "mm": "mouse",
+    }
+
+    if s in mapping:
+        return mapping[s]
+
+    valid = ", ".join(sorted(mapping.keys()))
+    raise ValueError(
+        f"不支持的物种参数: {organism!r}。当前仅内置支持 Human/Mouse。可接受别名包括: {valid}"
+    )
+
+
 def run_enrichr(top_genes: list, organism: str = "Human"):
     if not GSEAPY_OK:
         raise RuntimeError("缺少 gseapy，无法做 GO/KEGG。请安装：pip install gseapy")
 
-    if organism.lower().startswith("h"):
+    org = normalize_enrichr_organism(organism)
+
+    if org == "human":
         libs = [
             "GO_Biological_Process_2021",
             "GO_Molecular_Function_2021",
             "GO_Cellular_Component_2021",
             "KEGG_2021_Human",
         ]
-    else:
+    elif org == "mouse":
         libs = [
             "GO_Biological_Process_2021",
             "GO_Molecular_Function_2021",
             "GO_Cellular_Component_2021",
             "KEGG_2021_Mouse",
         ]
+    else:
+        raise ValueError(f"内部错误：未识别 organism={org}")
 
     out = {}
+    failed = []
+
     for lib in libs:
-        enr = gp.enrichr(gene_list=top_genes, gene_sets=lib, organism=organism, outdir=None)
-        out[lib] = enr.results.copy()
+        try:
+            enr = gp.enrichr(
+                gene_list=top_genes,
+                gene_sets=lib,
+                organism=org,     # 这里必须传 human / mouse 这类合法值
+                outdir=None,
+                no_plot=True,
+            )
+            out[lib] = enr.results.copy()
+        except Exception as e:
+            failed.append(f"{lib}: {e}")
+
+    if len(out) == 0:
+        raise RuntimeError("所有富集库均运行失败：\n" + "\n".join(failed))
+
     return out
 
 
@@ -438,7 +482,7 @@ def cluster_samples_by_top_genes(rna: pd.DataFrame, top_genes: list, n_clusters:
     if len(genes_exist) < 2:
         raise ValueError("Top genes 在 RNA 中匹配到的基因太少（<2），无法聚类。")
 
-    X = rna.loc[genes_exist].T.astype(float)  # samples x genes
+    X = rna.loc[genes_exist].T.astype(float)
     X_scaled = StandardScaler().fit_transform(X.values)
 
     km = KMeans(n_clusters=int(n_clusters), random_state=int(seed), n_init="auto")
@@ -688,8 +732,6 @@ def render_sticky_toolbar():
       }}
       .btn:hover {{ background: rgba(246,248,252,0.95); transform: translateY(-1px); }}
       .btn.primary {{ border-color: rgba(46,125,255,0.35); background: rgba(46,125,255,0.10); }}
-
-      /* highlight by scroll (active) */
       .btn.active {{
         border-color: rgba(37,99,235,0.60);
         background: linear-gradient(135deg, rgba(37,99,235,0.22), rgba(59,130,246,0.14));
@@ -810,9 +852,7 @@ st.markdown(
       .smallMuted { opacity: 0.70; font-size: 0.90rem; }
       .stDataFrame { border-radius: 12px; overflow: hidden; }
 
-      /* ---- module buttons: make active state obvious; no checkmark used ---- */
       .modbtn-row { display:flex; gap:10px; flex-wrap: wrap; margin: 8px 0 12px 0; }
-      /* Streamlit button styling hook (best-effort) */
       div[data-testid="stButton"] > button.modbtn {
         border: 1px solid rgba(15,23,42,0.14) !important;
         background: rgba(255,255,255,0.72) !important;
@@ -1176,7 +1216,6 @@ if run_button:
 
     top20_genes = stability_df.sort_values("MeanImportance", ascending=False)["Gene"].head(20).tolist()
 
-    # cache
     st.session_state["cache_rna"] = rna
     st.session_state["cache_labels"] = labels
     st.session_state["cache_top20_genes"] = top20_genes
@@ -1188,7 +1227,6 @@ if run_button:
     st.session_state["cache_last_z_test"] = last_z_test
     st.session_state["cache_cached_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # artifacts
     artifact_put_df_csv("model_metrics_all_runs.csv", metrics_df, note="每次 run 的指标")
     artifact_put_df_csv("model_metrics_summary.csv", summary_df, note="指标均值±标准差")
     artifact_put_df_csv("latent_shap_gene_importance_stability.csv", stability_df, note="基因稳定性（Mean/CV/Freq）")
@@ -1209,7 +1247,6 @@ if run_button:
     except Exception:
         pass
 
-    # clear downstream caches
     for k in [
         "cache_enrich_go_kegg",
         "cache_enrich_lib_idx",
@@ -1221,7 +1258,6 @@ if run_button:
     ]:
         st.session_state.pop(k, None)
 
-    # default page
     st.session_state["page"] = "主流程"
     st.success("✅ 主流程运行完成：结果已缓存（切换页面/下载不会丢失）。")
     st.rerun()
@@ -1262,7 +1298,7 @@ if "cache_metrics_df" in st.session_state:
 
 
 # =====================================================
-# Button Navigation (replaces Tabs) — NO CHECKMARK
+# Button Navigation (replaces Tabs)
 # =====================================================
 PAGES = ["主流程", "下载中心", "功能富集", "差异分析", "聚类&生存"]
 if "page" not in st.session_state:
@@ -1275,18 +1311,11 @@ cols = st.columns([1, 1, 1, 1, 1])
 for i, p in enumerate(PAGES):
     with cols[i]:
         is_active = (st.session_state["page"] == p)
-
-        # 关键：不加 ✅，仅用颜色区分
-        btn_label = p
-
-        # 用 key 区分；并用 JS 给当前按钮加 class active（CSS 控制明显颜色）
-        clicked = st.button(btn_label, use_container_width=True, key=f"nav_{p}")
+        clicked = st.button(p, use_container_width=True, key=f"nav_{p}")
         if clicked:
             st.session_state["page"] = p
             st.rerun()
 
-        # 给渲染出来的“最后一个按钮”打标签不太可靠，采用 JS：按文本匹配并给 active 加 class
-        # 这段每次都会跑一遍，确保当前选中态生效
         if is_active:
             components.html(
                 f"""
@@ -1297,7 +1326,6 @@ for i, p in enumerate(PAGES):
                       b.classList.add("modbtn");
                       b.classList.add("active");
                     }} else if (b.classList.contains("modbtn")) {{
-                      // 只移除 modbtn 的 active，不影响其他按钮
                       b.classList.remove("active");
                     }}
                   }});
@@ -1306,7 +1334,6 @@ for i, p in enumerate(PAGES):
                 height=0,
             )
         else:
-            # ensure modbtn class exists for consistent style
             components.html(
                 f"""
                 <script>
@@ -1447,7 +1474,7 @@ def render_enrich():
                 st.session_state["cache_enrich_lib_idx"] = 0
                 for lib, df in res_dict.items():
                     artifact_put_df_csv(f"enrichr_{lib}.csv", df, note=f"Enrichr: {lib}")
-                st.success("富集完成 ✅")
+                st.success(f"富集完成 ✅ organism={normalize_enrichr_organism(org)}")
             except Exception as e:
                 st.error(f"富集失败：{e}")
                 return
